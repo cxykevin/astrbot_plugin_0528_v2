@@ -1,0 +1,7 @@
+name: astrbot_plugin_0528_v2 # 插件唯一识别名，必须与插件目录名一致
+display_name: 0528 v2 · 开发中 # 用于展示的名字（需要版本 >= v4.5.0）
+desc: 开发中的插件骨架：启动时自动检查两个前置插件（astrbot_plugin_librunner / astrbot_plugin_libi18nject），缺失就自动下载并就地启用。
+version: v0.1.0 # 插件版本号。格式：v1.1.1 或者 v1.1
+author: cxykevin # 作者
+repo: https://github.com/cxykevin/astrbot_plugin_0528_v2 # 插件的仓库地址（发布前确认）
+astrbot_version: ">=4.29.0" # 与两个前置插件的基线一致

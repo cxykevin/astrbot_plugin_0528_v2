@@ -1,0 +1,20 @@
+{
+    "enforce_prerequisite": {
+        "description": "强制前置插件（缺失则停用本插件）",
+        "type": "bool",
+        "default": true,
+        "hint": "本插件依赖 astrbot_plugin_librunner（执行器注入接口）与 astrbot_plugin_libi18nject（WebUI 文案注入）。开启时：启动先检查这两个前置，缺失就自动 gh/git clone 装上并就地启用（不会重启 AstrBot 主进程）；装不上就停用本插件，并把原因显示在插件页的「加载失败插件」里。关闭后即便缺前置也照常启用（功能可能不完整）。"
+    },
+    "prerequisite_librunner_repo": {
+        "description": "前置插件来源：librunner",
+        "type": "string",
+        "default": "cxykevin/astrbot_plugin_librunner",
+        "hint": "自动安装 astrbot_plugin_librunner 时使用的 GitHub owner/repo，也可以写完整 git 地址（内网/镜像）。只有缺少该前置且「强制前置插件」开启时才会用到。"
+    },
+    "prerequisite_libi18nject_repo": {
+        "description": "前置插件来源：libi18nject",
+        "type": "string",
+        "default": "cxykevin/astrbot_plugin_libi18nject",
+        "hint": "自动安装 astrbot_plugin_libi18nject 时使用的 GitHub owner/repo，也可以写完整 git 地址（内网/镜像）。它是 librunner 的前置，会先于 librunner 安装。"
+    }
+}
