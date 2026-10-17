@@ -16,5 +16,41 @@
         "type": "string",
         "default": "cxykevin/astrbot_plugin_libi18nject",
         "hint": "自动安装 astrbot_plugin_libi18nject 时使用的 GitHub owner/repo，也可以写完整 git 地址（内网/镜像）。它是 librunner 的前置，会先于 librunner 安装。"
+    },
+    "acp_url": {
+        "description": "Alkaid0 ACP 地址（WebSocket）",
+        "type": "string",
+        "default": "ws://127.0.0.1:7433/acp",
+        "hint": "形如 ws://127.0.0.1:7433/acp?key=<key>（认证走 Query 参数 key）。这里只是兜底默认值：执行器面板（AI → Agent 执行方式 → Alkaid0）里填了就以面板为准。"
+    },
+    "workspace_template": {
+        "description": "工作目录模板",
+        "type": "string",
+        "default": "/root/alkaid0/{groupid}",
+        "hint": "一个群一个工作目录。支持 {groupid}（群号；私聊没有群号时用会话号）、{sessionid}、{platform}，不认识的占位符原样保留。目录需要在 alkaid0 侧已存在（session/new 不会创建目录）。同样以执行器面板为准。"
+    },
+    "idle_timeout_sec": {
+        "description": "群空闲回收秒数",
+        "type": "int",
+        "default": 1800,
+        "hint": "一个群这么久没有消息，就结束它的 ACP 会话并断开连接（下次来消息再重建连接与新会话）；0 表示不自动回收。以执行器面板为准。"
+    },
+    "turn_timeout_sec": {
+        "description": "单轮最大等待秒数",
+        "type": "int",
+        "default": 900,
+        "hint": "提交 prompt 后最多等多久（等到 state_update idle 为止）；超时按报错处理。以执行器面板为准。"
+    },
+    "echo_events": {
+        "description": "回显过程消息（工具调用 / 子 Agent / 后台任务）",
+        "type": "bool",
+        "default": true,
+        "hint": "把 alkaid0 的过程消息一起发到聊天里：🔧 工具调用（含状态与后台任务号）、🤖 子 Agent 切换、✅ 后台任务结束。同一状态只发一次，工具流式预览不发。关闭后只发最终答复（工具审批提示不受这个开关影响）。以执行器面板为准。"
+    },
+    "show_thought": {
+        "description": "把思考过程一起发出去",
+        "type": "bool",
+        "default": false,
+        "hint": "开启后，alkaid0 推送的 agent_thought(_chunk) 会以 reasoning 消息链的形式发出去。以执行器面板为准。"
     }
 }
