@@ -37,7 +37,13 @@ from astrbot.core.provider.entities import LLMResponse, ProviderRequest
 from .acp import ACPConnectionError, ACPError, GroupSession, SessionPool
 from .acp import protocol as acp
 from .acp.client import DEFERRED
-from .turn_queue import ACTION_ABSORBED, ACTION_MERGED, TurnQueue, TurnSlot
+from .turn_queue import (
+    ACTION_ABSORBED,
+    ACTION_MERGED,
+    TurnQueue,
+    TurnSlot,
+    strip_leading_slash,
+)
 
 #: 日志前缀（与插件其它模块一致）。
 LOG_PREFIX = "0528v2"
@@ -440,12 +446,12 @@ def apply_prompt_settings(
     * ``identifier``：每个发言人一行 ``[Reminder: @昵称(用户ID)]``（攒批时逐条给）；
     * ``group_name_display``：一行 ``Group name: 群名``。
 
-    以 ``/`` 开头的命令形式提示词**原样返回**（老版同样跳过注入），配置不是映射时
-    也原样返回。
+    发送前会去掉提示词最前面的 ``/``（避免被 alkaid0 当成远端斜杠命令），去掉后
+    按普通消息注入；去掉后为空则返回空串，配置不是映射时只做去斜杠。
     """
-    body = prompt or ""
-    if body.lstrip().startswith("/"):
-        return body
+    body = strip_leading_slash(prompt)
+    if not body:
+        return ""
     if not isinstance(config, Mapping):
         return body
 
@@ -931,7 +937,9 @@ class Alkaid0Runner(BaseAgentRunner[AstrAgentContext]):
         self._transition_state(AgentState.RUNNING)
         await self._announce_begin()
 
-        prompt_text = (getattr(self.request, "prompt", "") or "").strip()
+        # 发到 alkaid0 之前去掉消息开头的斜杠：否则会被当成远端斜杠命令
+        # （``/hello`` → ``hello``；``/acmd`` 走的命令通道不经过这里）。
+        prompt_text = strip_leading_slash(getattr(self.request, "prompt", "") or "")
         event = self._event()
         if not prompt_text:
             async for response in self._fail("提示词为空，没有内容可以发给 Alkaid0"):

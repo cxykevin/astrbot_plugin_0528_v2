@@ -1001,11 +1001,16 @@ check(
     == "在吗",
 )
 check(
-    "注入：命令形式的提示词原样返回",
+    "注入：开头的 / 会被去掉，去掉后照常注入",
     runner_mod.apply_prompt_settings(
         "/compress", _INJECT_CFG, senders=(("张三", "1"),), group_name="群"
     )
-    == "/compress",
+    == "P:compress\n[Reminder: @张三(1)]\nGroup name: 群",
+)
+check(
+    "注入：只有 / 或空白时返回空串",
+    runner_mod.apply_prompt_settings("/", _INJECT_CFG) == ""
+    and runner_mod.apply_prompt_settings("  /  ", _INJECT_CFG) == "",
 )
 check(
     "注入：非映射配置原样返回",
@@ -3686,16 +3691,28 @@ async def turn_queue_checks():
     """群内闸门：立刻开跑 / 排队攒批 / 静默收尾 / 取消摘队；插话落库与启动恢复。"""
     queue_dir = Path(tempfile.mkdtemp(prefix="0528v2-queue-"))
 
+    check(
+        "strip_leading_slash：去掉前导 /、保留中间的 /",
+        turn_queue_mod.strip_leading_slash("/hello") == "hello"
+        and turn_queue_mod.strip_leading_slash("/ hello") == "hello"
+        and turn_queue_mod.strip_leading_slash("  //a") == "a"
+        and turn_queue_mod.strip_leading_slash("a/b") == "a/b"
+        and turn_queue_mod.strip_leading_slash("/") == ""
+        and turn_queue_mod.strip_leading_slash("") == "",
+    )
+
     merged = turn_queue_mod.merge_prompt(
         [
             SimpleNamespace(label="张三", text=" 帮我看看 A "),
             SimpleNamespace(label="", text="顺便看下 B"),
             SimpleNamespace(label="李四", text="   "),
+            SimpleNamespace(label="王五", text="/看一下 C"),
         ]
     )
     check(
-        "merge_prompt：带表头、标发言人、跳过空发言",
-        merged == "（群里攒了 3 条消息，一起看一下）\n[张三] 帮我看看 A\n顺便看下 B",
+        "merge_prompt：带表头、标发言人、跳过空发言、去掉前导 /",
+        merged
+        == "（群里攒了 4 条消息，一起看一下）\n[张三] 帮我看看 A\n顺便看下 B\n[王五] 看一下 C",
         merged,
     )
     check(

@@ -47,8 +47,9 @@
     `/aworkdir reset` 回到模板默认。
 12. **请求注入**：照 AstrBot 全局的 `provider_settings` 给发往 alkaid0 的提示词补上
     `prompt_prefix`、`[Reminder: @昵称(用户ID)]`（`identifier`）与 `Group name: 群名`
-    （`group_name_display`）—— 走第三方执行器时内核不会替我们做这些；以 `/` 开头的命令形式
-    不注入（与老版 0528 的行为一致）。
+    （`group_name_display`）—— 走第三方执行器时内核不会替我们做这些。
+    发出去之前会去掉消息最前面的 `/`（`/hello` → `hello`，否则会被 alkaid0 当成远端斜杠
+    命令执行），去掉后按普通消息照常注入；`/acmd` 是显式发命令，不经过这里。
 13. **工具审批走 `/aapprove`**：alkaid0 请求工具审批时，插件**不自动批准、也不主动拒绝**，
     只把请求挂起、往聊天里发一行「⏳ 工具审批：工具名（回复 /aapprove 允许）」；
     发 `/aapprove` 才回 `allow_once`。不批准、直接继续发消息就等于拒绝（alkaid0 侧
@@ -186,7 +187,8 @@ astrbot_plugin_0528_v2/
 # 中止当前轮与 /astop（session/cancel 走通知、没在跑 / 发不出去都如实上报）、
 # 上下文用量与 /actx（usage_update 解析、会话缓存与换/新开会话清空、渲染口径）、
 # 群内闸门与排队落库（攒批提示词 / 静默收尾 / 取消摘队 / 落库往返 / 启动恢复 / 坏库降级）、
-# 工作目录（模板根 / 相对路径校验 / 绑定解析 / 自动建目录重试）、请求注入（provider_settings）、
+# 工作目录（模板根 / 相对路径校验 / 绑定解析 / 自动建目录重试）、
+# 请求注入（provider_settings / 消息开头的 / 会被去掉）、
 # 工具审批（挂起不回包 / 审批提示 / /aapprove 回包与失效）、
 # /aworkdir 各分支、执行器注册/注销、状态文本、schema 一致性
 uv run python data/plugins/astrbot_plugin_0528_v2/selftest.py
@@ -224,7 +226,8 @@ uv run ruff check data/plugins/astrbot_plugin_0528_v2/
   服务端不支持这个扩展（非 alkaid0）时同样原样报错；
 - **请求注入依赖 `provider_settings`**：`prompt_prefix` / `identifier` / `group_name_display`
   都照 AstrBot 全局配置来（读不到就一个都不加）；群名优先用消息自带的，`N/A`/缺失时才调
-  `get_group()` 查一次（仅 aiocqhttp 这类平台支持）；`/` 开头的命令消息不注入；
+  `get_group()` 查一次（仅 aiocqhttp 这类平台支持）；消息最前面的 `/` 会先去掉
+  （`/hello` → `hello`）再注入；`/acmd` 是显式命令通道，不受影响；
 - **`/aworkdir` 会断开本群旧连接**：绑定变了，下一条消息用新目录重建会话（记录里的旧会话
   `cwd` 对不上会被自动丢弃）；正在跑一轮时直接拒绝切换（提示先 `/astop`），不会打断它；
 - **续接但不回放历史**：`session/resume` 故意不带 `replayFrom`（ACP v2 下省略即只重连）。

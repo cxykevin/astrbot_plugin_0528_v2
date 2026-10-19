@@ -77,6 +77,19 @@ class TurnSlot:
     senders: tuple[tuple[str, str], ...] = ()
 
 
+def strip_leading_slash(text: str) -> str:
+    """去掉消息最前面的斜杠（发给 alkaid0 之前用，纯函数）。
+
+    ``/hello`` → ``hello``、``/ hello`` → ``hello``、``//a`` → ``a``；
+    没有前导斜杠的原样返回（顺手去掉两端空白），全是斜杠 / 空白时返回空串。
+    """
+
+    body = (text or "").strip()
+    if not body.startswith("/"):
+        return body
+    return body.lstrip("/").strip()
+
+
 def merge_prompt(items: list[_Pending]) -> str:
     """把攒下的几条插话合成一条提示词（纯函数，便于自测）。
 
@@ -90,7 +103,7 @@ def merge_prompt(items: list[_Pending]) -> str:
     """
     lines = [MERGE_HEADER.format(count=len(items))]
     for item in items:
-        body = item.text.strip()
+        body = strip_leading_slash(item.text)
         if not body:
             continue
         lines.append(f"[{item.label}] {body}" if item.label else body)
