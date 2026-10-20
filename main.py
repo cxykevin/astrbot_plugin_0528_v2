@@ -35,11 +35,14 @@ from astrbot.api.star import Context, Star
 from astrbot.core.star.filter.command import GreedyStr
 
 from . import agent_runner as runner_mod
+from . import panel as panel_mod
 from . import prerequisite as prerequisite_mod
+from . import remote_config as remote_config_mod
 from .acp import commands as acp_commands
 from .acp import pool as pool_mod
 from .acp import protocol as acp_protocol
 from .acp.store import SessionStore
+from .panel import mask_url
 from .turn_queue import TurnQueue
 
 #: 插件名（与 metadata.yaml / 目录名一致）。
@@ -251,28 +254,8 @@ def render_context_usage(usage: tuple[int, int] | None) -> str:
     return f"context {min(int(used / size * 100), 100)}% ({used}/{size})"
 
 
-#: URL 查询参数里需要打码的名字（状态命令会把地址发到群里，别把凭证带出去）。
-_REDACTED_PARAMS = ("key", "token", "secret", "password")
-
-
-def mask_url(url: str) -> str:
-    """把 URL 查询参数里的凭证值打掉：``ws://host/acp?key=abc`` → ``?key=***``。
-
-    alkaid0 的访问密钥通常就写在 ACP 地址的查询参数里，而 ``/0528v2`` 会把当前
-    生效的地址发到聊天里 —— 发之前先打码，其余部分（主机、路径、其它参数）照常显示。
-    """
-    text = (url or "").strip()
-    head, sep, query = text.partition("?")
-    if not sep:
-        return text
-    parts = []
-    for item in query.split("&"):
-        name, eq, _value = item.partition("=")
-        if eq and name.strip().lower() in _REDACTED_PARAMS:
-            parts.append(f"{name}=***")
-        else:
-            parts.append(item)
-    return f"{head}?{'&'.join(parts)}"
+#: 状态命令会把生效地址发到群里，所以地址脱敏由 :mod:`panel` 统一处理
+#: （``?key=***``、userinfo 里的密码也会打码）。
 
 
 class Plugin0528V2(Star):
@@ -281,7 +264,9 @@ class Plugin0528V2(Star):
     def __init__(self, context: Context, config: dict | None = None) -> None:
         super().__init__(context)
         self.context = context
-        self.plugin_config: dict[str, Any] = config or {}
+        # 保留传入的 AstrBotConfig 对象（面板保存要靠它的 save_config_async）；
+        # 空配置也不能换成普通 dict。
+        self.plugin_config: dict[str, Any] = config if config is not None else {}
         #: 最近一次启动时的前置检查结果（供状态命令展示）。
         self._prereq_report: prerequisite_mod.MultiEnsureResult | None = None
         #: 本插件就地拉起的前置实例，terminate 时释放。
@@ -296,10 +281,25 @@ class Plugin0528V2(Star):
         self._restored_pending = 0
         #: ``alkaid0`` 执行器是否已注册进 librunner。
         self._runner_registered = False
+        #: WebUI 配置面板（配置树 + 保存接口），initialize 时注册路由。
+        self._panel = panel_mod.PanelService(
+            self.plugin_config,
+            plugin_name=PLUGIN_NAME,
+            version=PLUGIN_VERSION,
+            panel_config_provider=self._panel_config,
+            after_save=self._after_panel_save,
+        )
+        #: alkaid0 全局配置的远程读写（走 ACP config/get|set|reload）。
+        self._remote_config = remote_config_mod.RemoteConfigService(
+            plugin_name=PLUGIN_NAME,
+            url_provider=lambda: self._settings().url,
+        )
 
     # ------------------------------------------------------------ 生命周期
     async def initialize(self) -> None:
         """插件启用：先确保两个前置插件就绪，再注册执行器、拉起连接池。"""
+        self._panel.register(self.context)
+        self._remote_config.register(self.context)
         await self._ensure_prerequisites()
         self._ensure_pool()
         self._ensure_queue()
@@ -312,6 +312,8 @@ class Plugin0528V2(Star):
         顺序不能反：执行器注册与连接都是「业务」，要在前置（librunner / libi18nject）
         还在的时候撤销；随后再逆序释放前置实例。
         """
+        self._panel.unregister(self.context)
+        self._remote_config.unregister(self.context)
         self._unregister_runner()
         await self._shutdown_pool()
         # 队列里还排着的插话留在库里，下次启动捞回来接着处理（见 _ensure_queue）
@@ -415,6 +417,23 @@ class Plugin0528V2(Star):
         return runner_mod.RunnerSettings.from_config(
             self._panel_config(), self.plugin_config
         )
+
+    async def _after_panel_save(self, changed: dict[str, Any]) -> bool:
+        """配置面板保存后的运行时刷新；返回是否需要重载插件才生效。
+
+        连接池的空闲阈值是启动时抄进池子里的，保存后要同步一下；其它参数
+        （地址 / 模板 / 超时 / 回显开关）在下一条消息重新解析配置时自然生效，
+        不需要断连接。前置插件相关的开关只在 ``initialize`` 里读，必须重载。
+        """
+        idle = changed.get("idle_timeout_sec")
+        if idle is not None and self._pool is not None:
+            try:
+                self._pool.set_idle_timeout(float(idle))
+            except Exception as exc:  # noqa: BLE001 - 刷新失败不该让保存失败
+                logger.warning(
+                    "%s: 面板保存后同步空闲回收阈值失败：%s", LOG_PREFIX, exc
+                )
+        return any(key in panel_mod.RELOAD_KEYS for key in changed)
 
     def _cwd_for(
         self, key: str, event: AstrMessageEvent, settings: runner_mod.RunnerSettings
@@ -579,7 +598,7 @@ class Plugin0528V2(Star):
             lines.append(
                 f"- {prereq.name}: {'已安装' if installed else '未安装'}；"
                 f"{'内核已加载' if loaded else '内核未加载'}"
-                f"（来源 {prereq.repo}）"
+                f"（来源 {mask_url(prereq.repo)}）"
             )
         if self._prereq_report is not None:
             lines.append("最近一次启动检查:")

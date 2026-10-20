@@ -464,9 +464,11 @@ class SessionPool:
         ]
 
     def set_idle_timeout(self, seconds: float) -> None:
-        """更新空闲回收阈值（执行器面板上的值变了就调一下）。"""
-        if seconds and seconds > 0:
-            self.idle_timeout = float(seconds)
+        """更新空闲回收阈值（执行器面板上的值变了就调一下）。
+
+        ``0`` 表示关闭自动回收，必须同步进去；负数按 ``0`` 处理。
+        """
+        self.idle_timeout = max(0.0, float(seconds))
 
     @property
     def reaper_running(self) -> bool:

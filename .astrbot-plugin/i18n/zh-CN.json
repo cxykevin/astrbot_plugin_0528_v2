@@ -1,0 +1,216 @@
+{
+  "metadata": {
+    "display_name": "0528 v2 · Alkaid0 中继",
+    "short_desc": "把 AstrBot 群聊接到 Alkaid0 Coding Agent。",
+    "desc": "把 AstrBot 的消息交给 Alkaid0 Coding Agent：注册 alkaid0 执行器，按群维护 ACP v2（WebSocket）连接与会话，空闲自动回收；启动时自动检查两个前置插件（astrbot_plugin_librunner / astrbot_plugin_libi18nject），缺失就自动下载并就地启用。"
+  },
+  "config": {
+    "enforce_prerequisite": {
+      "description": "强制前置插件（缺失则停用本插件）",
+      "hint": "本插件依赖 astrbot_plugin_librunner（执行器注入接口）与 astrbot_plugin_libi18nject（WebUI 文案注入）。开启时：启动先检查这两个前置，缺失就自动 gh/git clone 装上并就地启用（不会重启 AstrBot 主进程）；装不上就停用本插件，并把原因显示在插件页的「加载失败插件」里。关闭后即便缺前置也照常启用（功能可能不完整）。"
+    },
+    "prerequisite_librunner_repo": {
+      "description": "前置插件来源：librunner",
+      "hint": "自动安装 astrbot_plugin_librunner 时使用的 GitHub owner/repo，也可以写完整 git 地址（内网/镜像）。只有缺少该前置且「强制前置插件」开启时才会用到。"
+    },
+    "prerequisite_libi18nject_repo": {
+      "description": "前置插件来源：libi18nject",
+      "hint": "自动安装 astrbot_plugin_libi18nject 时使用的 GitHub owner/repo，也可以写完整 git 地址（内网/镜像）。它是 librunner 的前置，会先于 librunner 安装。"
+    },
+    "acp_url": {
+      "description": "Alkaid0 ACP 地址（WebSocket）",
+      "hint": "形如 ws://127.0.0.1:7433/acp?key=<key>（认证走 Query 参数 key）。这里只是兜底默认值：执行器面板（AI → Agent 执行方式 → Alkaid0）里填了就以面板为准。"
+    },
+    "workspace_template": {
+      "description": "工作目录模板",
+      "hint": "一个群一个工作目录。支持 {groupid}（群号；私聊没有群号时用会话号）、{sessionid}、{platform}，不认识的占位符原样保留。模板根（第一个占位符之前那段）需要在 alkaid0 侧已存在，渲染出的子目录会自动创建（fs/mkdir）。同样以执行器面板为准。"
+    },
+    "idle_timeout_sec": {
+      "description": "群空闲回收秒数",
+      "hint": "一个群这么久没有消息，就结束它的 ACP 会话并断开连接；下次来消息会续接记录里的会话（不回放历史）。0 表示不自动回收。以执行器面板为准。"
+    },
+    "turn_timeout_sec": {
+      "description": "单轮最大等待秒数",
+      "hint": "提交 prompt 后最多等多久（等到 state_update idle 为止）；超时按报错处理。以执行器面板为准。"
+    },
+    "echo_events": {
+      "description": "回显过程消息（工具调用 / 子 Agent / 后台任务）",
+      "hint": "把 alkaid0 的过程消息一起发到聊天里：🔧 工具调用（含状态与后台任务号）、🤖 子 Agent 切换、✅ 后台任务结束。同一状态只发一次，工具流式预览不发。关闭后只发最终答复（工具审批提示不受这个开关影响）。以执行器面板为准。"
+    },
+    "show_thought": {
+      "description": "把思考过程一起发出去",
+      "hint": "开启后，alkaid0 推送的 agent_thought(_chunk) 会以 reasoning 消息链的形式发出去。以执行器面板为准。"
+    }
+  },
+  "views": {
+    "settings": {
+      "title": "插件配置",
+      "description": "以树状菜单查看并修改本插件的 AstrBot 配置；Alkaid0 的全局配置请打开「Alkaid0 全局配置」视图。",
+      "groups": {
+        "prerequisites": {
+          "title": "前置插件",
+          "description": "管理本插件依赖的两个前置：librunner（执行器注入）与 libi18nject（WebUI 文案）。"
+        },
+        "connection": {
+          "title": "连接与超时",
+          "description": "Alkaid0 的 ACP 地址、群空闲回收与单轮等待时间。"
+        },
+        "workspace": {
+          "title": "工作目录",
+          "description": "一个群一个工作目录，支持 {groupid} / {sessionid} / {platform} 占位符。"
+        },
+        "chat": {
+          "title": "聊天回显",
+          "description": "控制工具调用等过程消息、以及思考过程是否发到群里。"
+        },
+        "other": {
+          "title": "其它",
+          "description": "schema 里尚未归类的配置项。"
+        }
+      },
+      "ui": {
+        "title": "配置面板",
+        "subtitle": "以树状菜单查看并修改 0528 v2 的插件配置。",
+        "expand_all": "展开全部",
+        "collapse_all": "折叠全部",
+        "reload": "重新载入",
+        "save": "保存",
+        "loading": "正在读取配置…",
+        "saving": "正在保存…",
+        "saved": "已保存 {n} 项。",
+        "no_changes": "没有需要保存的改动。",
+        "unsaved": "有 {n} 项未保存。",
+        "on": "开启",
+        "off": "关闭",
+        "show": "显示",
+        "hide": "隐藏",
+        "reset_default": "恢复默认",
+        "default_value": "默认",
+        "effective_value": "生效",
+        "panel_value": "执行器面板",
+        "badge_reload": "需重载",
+        "badge_reload_hint": "保存后需要重载插件才生效。",
+        "badge_override": "面板覆盖中",
+        "badge_override_hint": "执行器面板里的同名字段优先；要让这里生效，请把面板里的值留空。",
+        "badge_masked": "敏感字段",
+        "masked_short": "*** 表示已脱敏，保存时会保留原值",
+        "masked_hint": "*** 表示保留原值；只改主机、路径或其它参数时不会动到凭证。",
+        "override_banner": "执行器面板（AI → Agent 执行方式 → Alkaid0）里的值优先于插件配置；带「面板覆盖中」标记的字段改了也不会生效。",
+        "reload_warning": "前置插件相关设置已保存，需要重载插件后生效。",
+        "empty": "没有可编辑的配置项。",
+        "empty_group": "这个分组还没有配置项。"
+      },
+      "errors": {
+        "bad_payload": "请求格式不正确。",
+        "bad_response": "配置接口返回了无法识别的数据。",
+        "no_changes": "没有需要保存的改动。",
+        "unknown_field": "不认识的配置项：{field}",
+        "invalid_type": "「{field}」的类型不正确。",
+        "out_of_range": "「{field}」超出允许范围。",
+        "too_long": "「{field}」太长。",
+        "invalid_url": "「{field}」不是合法的 WebSocket 地址（需要 ws:// 或 wss://）。",
+        "unresolved_mask": "「{field}」里的 *** 没有可还原的原值，请把完整值填进来。",
+        "not_writable": "当前插件配置不可写（缺少保存接口）。",
+        "save_failed": "写入配置文件失败，请查看 AstrBot 日志。",
+        "bridge_unavailable": "找不到 AstrBot 插件页 bridge，请从插件页打开这个视图。",
+        "bridge_timeout": "连接 Dashboard 超时，请从插件页重新打开这个视图。",
+        "unknown": "操作失败：{detail}"
+      }
+    },
+    "remote": {
+      "title": "Alkaid0 全局配置",
+      "description": "直接读写 alkaid0 的全局配置；只提交改动过的字段，敏感值自动脱敏。",
+      "ui": {
+        "title": "Alkaid0 全局配置",
+        "subtitle": "直接读写 alkaid0 的全局配置；只提交改动过的字段，敏感值自动脱敏。",
+        "tree": "可视化",
+        "json": "JSON",
+        "expand_all": "展开全部",
+        "collapse_all": "折叠全部",
+        "reload": "重新读取",
+        "reload_remote": "从磁盘重载",
+        "save": "保存",
+        "loading": "正在从 alkaid0 读取配置…",
+        "saving": "正在保存…",
+        "saved": "已保存 {n} 项。",
+        "saved_refresh_failed": "已保存，但回读配置失败；请点「重新读取」确认最新值。",
+        "no_changes": "没有需要保存的改动。",
+        "unsaved": "有 {n} 项未保存。",
+        "masked_short": "*** 表示已脱敏；未改动的敏感字段不会出现在提交内容里。",
+        "server": "远端",
+        "readonly": "只读",
+        "secret": "敏感",
+        "restart": "需重启",
+        "readonly_hint": "只读字段",
+        "secret_hint": "敏感值已脱敏",
+        "url_hint": "URL 凭证会自动脱敏",
+        "secret_leaf_hint": "*** 表示保留原值；不修改就不会提交这个字段。",
+        "url_leaf_hint": "只改主机 / 路径时，查询参数里的 *** 会自动还原。",
+        "default": "默认",
+        "undo": "撤销",
+        "delete": "删除",
+        "add": "添加",
+        "add_item": "添加一项",
+        "new_key": "新键名",
+        "key_name": "键名",
+        "key_exists": "这个键已经存在。",
+        "value": "值",
+        "entries": "条目",
+        "other_entries": "其它条目",
+        "unknown_fields": "未在 schema 中的字段",
+        "empty": "空",
+        "empty_object": "这个对象还没有字段。",
+        "empty_array": "还没有条目。",
+        "empty_map": "还没有条目。",
+        "not_set": "尚未设置；编辑后保存时创建。",
+        "on": "开启",
+        "off": "关闭",
+        "masked": "已脱敏",
+        "item_count": "{n} 项",
+        "field_count": "{n} 个字段",
+        "move_up": "上移",
+        "move_down": "下移",
+        "show": "显示",
+        "hide": "隐藏",
+        "retry": "重试",
+        "cancel": "取消",
+        "confirm": "确定",
+        "json_unapplied": "JSON 有未应用的改动。",
+        "json_applied": "JSON 已应用到草稿，尚未保存。",
+        "json_synced": "已恢复到当前草稿。",
+        "json_hint": "这里编辑的是完整配置草稿；应用后仍需点「保存」才会写入 alkaid0。$schema 不会提交。",
+        "apply_json": "应用 JSON",
+        "format_json": "格式化",
+        "sync_json": "放弃编辑",
+        "json_value_invalid": "这里必须是合法 JSON：{detail}",
+        "refresh_failed": "配置已保存，但回读失败；请点「重新读取」确认最新值。",
+        "restart_warning": "已修改需要重启 alkaid0 的字段：{paths}。保存后请重启 alkaid0 使配置生效。",
+        "key_warning": "改 Server.key 后，本插件的执行器面板 / 插件配置也要同步新的 ACP 地址。",
+        "restart_confirm": "已修改需要重启 alkaid0 的字段：{paths}。\n保存后请重启 alkaid0 使配置生效。仍要保存吗？",
+        "key_confirm": "注意：改了 Server.key 之后，本插件的执行器面板 / 插件配置也要同步新的 ACP 地址，否则下一条消息会认证失败。",
+        "discard_confirm": "当前有未保存的改动，重新读取会丢弃它们。继续吗？",
+        "reload_remote_confirm": "让 alkaid0 从磁盘重新加载配置？这会覆盖内存里的当前值。",
+        "reloaded": "已从磁盘重载 alkaid0 配置。"
+      },
+      "errors": {
+        "bad_payload": "请求格式不正确。",
+        "bad_response": "远程配置接口返回了无法识别的数据。",
+        "bad_config": "alkaid0 返回的 config/get 结构不认识。",
+        "no_changes": "没有需要保存的改动。",
+        "unknown_field": "不认识的配置项：{detail}",
+        "unresolved_mask": "「{detail}」里的 *** 没有可还原的原值，请把完整值填进来。",
+        "too_large": "提交内容太大。",
+        "remote_unconfigured": "还没有配置 Alkaid0 的 ACP 地址。请先在执行器面板 / 插件配置里设置。",
+        "remote_unreachable": "连不上 alkaid0：{detail}",
+        "remote_timeout": "等待 alkaid0 超时。",
+        "remote_unsupported": "当前 alkaid0 不支持远程配置（需要 config/get|set|reload）。",
+        "remote_error": "alkaid0 返回错误：{detail}",
+        "bridge_unavailable": "找不到 AstrBot 插件页 bridge，请从插件页打开这个视图。",
+        "bridge_timeout": "连接 Dashboard 超时，请从插件页重新打开这个视图。",
+        "json_parse": "JSON 语法错误：{detail}",
+        "json_object_required": "JSON 顶层必须是一个对象。",
+        "unknown": "操作失败：{detail}"
+      }
+    }
+  }
+}

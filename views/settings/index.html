@@ -1,0 +1,93 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>0528 v2</title>
+    <link rel="stylesheet" href="./style.css" />
+  </head>
+  <body>
+    <main class="page">
+      <header class="page-header">
+        <div class="title-block">
+          <div class="title-line">
+            <h1 data-i18n="views.settings.ui.title" data-fallback="配置面板">配置面板</h1>
+            <span id="version" class="version" hidden></span>
+          </div>
+          <p
+            class="subtitle"
+            data-i18n="views.settings.ui.subtitle"
+            data-fallback="以树状菜单查看并修改 0528 v2 的插件配置。"
+          >
+            以树状菜单查看并修改 0528 v2 的插件配置。
+          </p>
+        </div>
+        <div class="toolbar">
+          <button
+            id="expand-all"
+            class="btn ghost"
+            type="button"
+            data-i18n="views.settings.ui.expand_all"
+            data-fallback="展开全部"
+          >
+            展开全部
+          </button>
+          <button
+            id="collapse-all"
+            class="btn ghost"
+            type="button"
+            data-i18n="views.settings.ui.collapse_all"
+            data-fallback="折叠全部"
+          >
+            折叠全部
+          </button>
+          <button
+            id="reload"
+            class="btn ghost"
+            type="button"
+            data-i18n="views.settings.ui.reload"
+            data-fallback="重新载入"
+          >
+            重新载入
+          </button>
+          <button
+            id="save"
+            class="btn primary"
+            type="button"
+            disabled
+            data-i18n="views.settings.ui.save"
+            data-fallback="保存"
+          >
+            保存
+          </button>
+        </div>
+      </header>
+
+      <div id="banner" class="banner" hidden>
+        <span id="banner-text"></span>
+      </div>
+
+      <section id="tree" class="tree" aria-live="polite" aria-busy="true">
+        <div
+          class="placeholder"
+          data-i18n="views.settings.ui.loading"
+          data-fallback="正在读取配置…"
+        >
+          正在读取配置…
+        </div>
+      </section>
+
+      <footer class="statusbar">
+        <span id="status" class="status" role="status" aria-live="polite"></span>
+        <span
+          class="hint"
+          data-i18n="views.settings.ui.masked_short"
+          data-fallback="*** 表示已脱敏，保存时会保留原值"
+        >
+          *** 表示已脱敏，保存时会保留原值
+        </span>
+      </footer>
+    </main>
+    <script type="module" src="./app.js"></script>
+  </body>
+</html>

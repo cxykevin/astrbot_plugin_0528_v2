@@ -54,6 +54,10 @@
     只把请求挂起、往聊天里发一行「⏳ 工具审批：工具名（回复 /aapprove 允许）」；
     发 `/aapprove` 才回 `allow_once`。不批准、直接继续发消息就等于拒绝（alkaid0 侧
     自己判定），所以不需要「拒绝」命令。审批开关与策略都在 alkaid0 自己的配置里。
+14. **两个可视化配置视图**：插件详情页里的「插件配置」改本插件的 AstrBot 配置（分组树状
+    展开，ACP 地址 / 仓库地址里的凭证只显示 `***`，保存时自动还原）；「Alkaid0 全局配置」
+    则直接读写 alkaid0 的全局配置（模型 / Agent / 服务器 / 搜索 / 脱敏…），支持树状勾选
+    与 JSON 编辑 —— 只提交改动过的叶子，没动过的敏感字段根本不会出现在 patch 里。
 
 > [!NOTE]
 > 这一版是**协议壳子**：ACP 传输（连接/握手/会话/提示词/通知/工具审批）、连接池与会话记录
@@ -135,6 +139,12 @@ libi18nject  ←  librunner  ←  astrbot_plugin_0528_v2
 astrbot_plugin_0528_v2/
 ├── main.py            插件主体：前置检查 + 注册执行器 + 连接池生命周期 + `/0528v2` `/actx` `/areset` `/astop` `/aapprove` `/amodel` `/aeffort` `/aresume` `/aworkdir` `/acmd`
 ├── agent_runner.py    Alkaid0Runner（一轮对话 → 一次 ACP prompt turn）+ `run_slash_command`（一轮命令）
+├── panel.py           插件配置面板后端：配置树 / 类型校验 / 凭证脱敏与还原 / 保存
+├── remote_config.py   alkaid0 远程配置后端：config/get|set|reload / 嵌套 patch 脱敏与还原
+├── views/settings/    「插件配置」视图（本插件的 AstrBot 配置，树状分组展开）
+├── views/remote/      「Alkaid0 全局配置」视图（树 + JSON 双模式，直接读写 alkaid0）
+├── .astrbot-plugin/
+│   └── i18n/          面板、配置项与视图元数据的 zh-CN / en-US 文案
 ├── acp/
 │   ├── protocol.py    ACP v2 常量与 JSON-RPC 编解码（无传输依赖）
 │   ├── client.py      一条 WebSocket 连接的 JSON-RPC 2.0 收发
@@ -174,6 +184,42 @@ astrbot_plugin_0528_v2/
 > 面板上的「执行器配置」在切换执行器时会被内核用注册时的默认值覆盖（内核既有行为）；
 > 常用参数建议也写进插件配置，兜底更稳。
 
+插件详情页提供两个可视化视图，先分清它们改的是哪一份配置：
+
+### 「插件配置」（`views/settings/`）
+
+改本插件自己的 AstrBot 配置（即上面的 `_conf_schema.json`）：按
+「前置插件 / 连接与超时 / 工作目录 / 聊天回显」树状展开所有字段，支持恢复默认、
+未保存提示与语言切换（zh-CN / en-US）。ACP 地址与仓库地址里的 `key`、`token`、
+`password` 等查询参数和 userinfo 凭证只显示 `***`，保存时自动还原成原值。
+执行器面板里已填的字段会标「面板覆盖中」；前置插件相关设置保存后需要重载插件才生效。
+
+### 「Alkaid0 全局配置」（`views/remote/`）
+
+直接读写 **alkaid0 自己的全局配置**（`~/.config/alkaid0/config.json` 那一份，不是本插件的
+AstrBot 配置），走 ACP 扩展方法：
+
+- `alk.cxykevin.top/config/get`：读取完整配置；
+- `alk.cxykevin.top/config/set`：只提交改动过的叶子（嵌套 patch），由 alkaid0 深度合并并持久化；
+- `alk.cxykevin.top/config/reload`：让 alkaid0 从磁盘重载配置。
+
+界面分「可视化」与「JSON」两种模式，编辑的是同一份草稿：可视化模式按
+`alkaid0_config_schema.json`（取自 alkaid0 的 `docs/schemas/config.json`）画树，
+模型 / 子 Agent / 搜索结果等 map / array 都能增删改；JSON 模式可以直接编辑完整配置。
+保存时只把**与初始配置不同的叶子**提交上去，所以：
+
+- `ProviderKey`、`Server.key`、`Token`、`TerminalEnvs` 里的 `*_KEY`、请求头里的
+  `Authorization` / `Cookie` 等敏感值只显示 `***`；没动过的敏感字段根本不会进入 patch；
+- `ProviderURL`、`Feedback.URL`、`Proxy` 等 URL 只打码 userinfo 与查询参数里的
+  `key` / `token` / `secret` / `password`；只改主机 / 路径时，保存前会把 `***` 自动还原；
+- 顶层 `$schema` 只是编辑器元数据，不展示、不提交；schema 里没有、但当前配置里已有的
+  顶层字段仍可在 JSON 模式里编辑（兼容 alkaid0 升级后新增字段），凭空写新顶层键会被拒绝。
+
+需要注意：`Server.host` / `port` / `key` / `path` 与 `ignoreSignals` 改完要**重启 alkaid0**
+才生效；尤其是 `Server.key`，改完还要把本插件执行器面板 / 插件配置里的 ACP 地址同步成
+新的 `?key=`，否则下一条消息会认证失败。视图会在保存前弹确认并列出这些字段。
+「从磁盘重载」会覆盖 alkaid0 内存里的当前值，有未保存草稿时会先提示丢弃。
+
 ---
 
 ## 开发环境
@@ -190,10 +236,13 @@ astrbot_plugin_0528_v2/
 # 工作目录（模板根 / 相对路径校验 / 绑定解析 / 自动建目录重试）、
 # 请求注入（provider_settings / 消息开头的 / 会被去掉）、
 # 工具审批（挂起不回包 / 审批提示 / /aapprove 回包与失效）、
+# 配置面板（字段树 / 类型校验 / 凭证脱敏与还原 / 保存回滚 / 路由注册 / i18n 完整性）、
+# alkaid0 全局配置（config/get|set|reload / 嵌套 patch 脱敏与还原 / 未知字段兼容 /
+# 远程服务与路由 / 树视图静态资源 / i18n 标题区分）、
 # /aworkdir 各分支、执行器注册/注销、状态文本、schema 一致性
 uv run python data/plugins/astrbot_plugin_0528_v2/selftest.py
 
-# 代码检查（selftest.py 里 10 个 E402 是刻意的 import 顺序，其余文件应零告警）
+# 代码检查（selftest.py 里若干 E402 是刻意的 import 顺序，其余文件应零告警）
 uv run ruff check data/plugins/astrbot_plugin_0528_v2/
 ```
 
@@ -202,6 +251,7 @@ uv run ruff check data/plugins/astrbot_plugin_0528_v2/
 | 手段 | 看什么 |
 | --- | --- |
 | 聊天里 `/0528v2` | 两个前置是否已安装 / 已由内核加载、执行器是否已注册、当前几条 ACP 连接（每条的会话 ID / 当前模型 / 是否跑着一轮 / 插话排队几条 / 空闲秒数 / 工作目录）、群内闸门排了多少插话（启动时从库里恢复了几条）、会话记录条数与库路径 |
+| 插件页 →「Alkaid0 全局配置」 | 直接读取 / 修改 alkaid0 的全局配置（树 + JSON 双模式）；只提交改动项，`***` 自动脱敏；改 `Server.host` / `port` / `key` / `path` 后需重启 alkaid0 并同步本插件 ACP 地址 |
 | 聊天里 `/amodel` | 本群会话可选的模型（`← 当前` 标出正在用的那个），以及怎么切；`/amodel 1`、`/amodel <名字>`、`/amodel 1/a` 都能切 |
 | 聊天里 `/aeffort` | 本群会话可选的推理强度（`unset`/`low`/`medium`/`high`/`max`/`xhigh`，`← 当前` 标出正在用的那个）；`/aeffort high`、`/aeffort High` 都行 |
 | 聊天里 `/aresume` | 本群工作目录下的会话列表（编号 / 标题 / 最后活动时间，`← 当前` 标出正在续接的那个）；`/aresume 9` 或 `/aresume sess_9:/path` 切过去 |
@@ -274,7 +324,22 @@ uv run ruff check data/plugins/astrbot_plugin_0528_v2/
   用户发 `/aapprove` 才回 `allow_once`；不批准、直接继续发消息就等于拒绝（alkaid0 侧自己判定，
   插件这边只清掉挂起记录）。审批开关与策略都在 alkaid0 自己的配置里，插件没有「自动批准」开关，
   也不提供拒绝命令；还没批准时连接被回收 / 插件停用，挂起记录随连接一起丢（服务端那边会按超时处理）；
+- **配置面板只编辑标量字段**：`_conf_schema.json` 里的 `bool` / `string` / `int` /
+  `float` / `text` 会出现在面板里；`list` / `object` / `template_list` 等复杂类型仍走
+  原生配置页。ACP 地址 / 仓库地址里的凭证显示为 `***`，保存时按字段名还原；
+  执行器面板里已填的同名字段仍优先，面板会标「面板覆盖中」；
+- **「Alkaid0 全局配置」直接写 alkaid0 的配置文件**：走 `config/get|set|reload`，只提交改动过的
+  叶子；schema 是打包在插件里的快照（`alkaid0_config_schema.json`，取自 alkaid0
+  `docs/schemas/config.json`），alkaid0 升级后新增、但快照里还没有的顶层字段仍可在 JSON
+  模式里编辑（只要它在当前配置里已经存在），凭空写新的顶层键会被拒绝。**schema 里没有
+  声明的字段默认按普通字段处理（不自动打码）**；动态 map 的值仍按声明的值类型处理，
+  例如 `TerminalEnvs` 里键名带 `KEY` 的环境变量照常打码。`Server.host` / `port` / `key` /
+  `path` / `disableStdioServer` / `ignoreSignals` 改完要重启 alkaid0；改 `Server.key`
+  还会让本插件当前的 ACP 地址失效，必须同步更新执行器面板 / 插件配置里的 `?key=`，
+  视图会在保存前确认。
+  「从磁盘重载」会覆盖 alkaid0 内存里的当前值，有未保存草稿时会先提示丢弃；
 - **卸载顺序**：卸载本插件前先在 WebUI 把执行器切回内置 Agent，避免配置里残留
   `alkaid0` 类型（librunner 会按 `orphan_runner_policy` 降级，但切回去更干净）；
-- **加载失败时的自救**：插件页的配置面板此时可能打不开，可以直接编辑
-  `data/config/astrbot_plugin_0528_v2_config.json`，保存后重载插件。
+- **加载失败时的自救**：插件页的新「配置面板」视图仍可能可用（路由在初始化前置检查
+  之前注册）；如果视图也打不开，就直接编辑 `data/config/astrbot_plugin_0528_v2_config.json`，
+  保存后重载插件。

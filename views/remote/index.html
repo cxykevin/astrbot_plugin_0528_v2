@@ -1,0 +1,202 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Alkaid0 全局配置</title>
+    <link rel="stylesheet" href="./style.css" />
+  </head>
+  <body>
+    <main class="page">
+      <header class="page-header">
+        <div class="title-block">
+          <div class="title-line">
+            <h1 data-i18n="views.remote.ui.title" data-fallback="Alkaid0 全局配置">
+              Alkaid0 全局配置
+            </h1>
+            <span id="version" class="pill" hidden></span>
+            <span id="server" class="pill mono" hidden></span>
+          </div>
+          <p
+            class="subtitle"
+            data-i18n="views.remote.ui.subtitle"
+            data-fallback="直接读写 alkaid0 的全局配置；只提交改动过的字段，敏感值自动脱敏。"
+          >
+            直接读写 alkaid0 的全局配置；只提交改动过的字段，敏感值自动脱敏。
+          </p>
+        </div>
+        <div class="toolbar">
+          <div class="tabs" role="tablist">
+            <button
+              id="mode-tree"
+              class="tab is-active"
+              type="button"
+              role="tab"
+              aria-selected="true"
+              data-i18n="views.remote.ui.tree"
+              data-fallback="可视化"
+            >
+              可视化
+            </button>
+            <button
+              id="mode-json"
+              class="tab"
+              type="button"
+              role="tab"
+              aria-selected="false"
+              data-i18n="views.remote.ui.json"
+              data-fallback="JSON"
+            >
+              JSON
+            </button>
+          </div>
+          <button
+            id="expand-all"
+            class="btn ghost"
+            type="button"
+            data-i18n="views.remote.ui.expand_all"
+            data-fallback="展开全部"
+          >
+            展开全部
+          </button>
+          <button
+            id="collapse-all"
+            class="btn ghost"
+            type="button"
+            data-i18n="views.remote.ui.collapse_all"
+            data-fallback="折叠全部"
+          >
+            折叠全部
+          </button>
+          <button
+            id="reload"
+            class="btn ghost"
+            type="button"
+            data-i18n="views.remote.ui.reload"
+            data-fallback="重新读取"
+          >
+            重新读取
+          </button>
+          <button
+            id="remote-reload"
+            class="btn ghost"
+            type="button"
+            data-i18n="views.remote.ui.reload_remote"
+            data-fallback="从磁盘重载"
+          >
+            从磁盘重载
+          </button>
+          <button
+            id="save"
+            class="btn primary"
+            type="button"
+            disabled
+            data-i18n="views.remote.ui.save"
+            data-fallback="保存"
+          >
+            保存
+          </button>
+        </div>
+      </header>
+
+      <div id="banner" class="banner" hidden>
+        <span id="banner-text"></span>
+      </div>
+
+      <section id="tree" class="tree" aria-live="polite" aria-busy="true">
+        <div
+          class="placeholder"
+          data-i18n="views.remote.ui.loading"
+          data-fallback="正在从 alkaid0 读取配置…"
+        >
+          正在从 alkaid0 读取配置…
+        </div>
+      </section>
+
+      <section id="json-panel" class="json-panel" hidden>
+        <div class="json-toolbar">
+          <button
+            id="apply-json"
+            class="btn primary"
+            type="button"
+            data-i18n="views.remote.ui.apply_json"
+            data-fallback="应用 JSON"
+          >
+            应用 JSON
+          </button>
+          <button
+            id="format-json"
+            class="btn ghost"
+            type="button"
+            data-i18n="views.remote.ui.format_json"
+            data-fallback="格式化"
+          >
+            格式化
+          </button>
+          <button
+            id="sync-json"
+            class="btn ghost"
+            type="button"
+            data-i18n="views.remote.ui.sync_json"
+            data-fallback="放弃编辑"
+          >
+            放弃编辑
+          </button>
+          <span
+            class="hint"
+            data-i18n="views.remote.ui.json_hint"
+            data-fallback="这里编辑的是完整配置草稿；应用后仍需点「保存」才会写入 alkaid0。$schema 不会提交。"
+          >
+            这里编辑的是完整配置草稿；应用后仍需点「保存」才会写入 alkaid0。$schema 不会提交。
+          </span>
+        </div>
+        <textarea
+          id="json-editor"
+          class="json-editor"
+          spellcheck="false"
+          autocomplete="off"
+          aria-label="JSON"
+        ></textarea>
+        <div id="json-error" class="json-error" hidden></div>
+      </section>
+
+      <div id="modal" class="modal" hidden>
+        <div class="modal-card" role="dialog" aria-modal="true" aria-labelledby="modal-text">
+          <p id="modal-text" class="modal-text"></p>
+          <div class="modal-actions">
+            <button
+              id="modal-cancel"
+              class="btn ghost"
+              type="button"
+              data-i18n="views.remote.ui.cancel"
+              data-fallback="取消"
+            >
+              取消
+            </button>
+            <button
+              id="modal-ok"
+              class="btn primary"
+              type="button"
+              data-i18n="views.remote.ui.confirm"
+              data-fallback="确定"
+            >
+              确定
+            </button>
+          </div>
+        </div>
+      </div>
+
+      <footer class="statusbar">
+        <span id="status" class="status" role="status" aria-live="polite"></span>
+        <span
+          class="hint"
+          data-i18n="views.remote.ui.masked_short"
+          data-fallback="*** 表示已脱敏；未改动的敏感字段不会出现在提交内容里。"
+        >
+          *** 表示已脱敏；未改动的敏感字段不会出现在提交内容里。
+        </span>
+      </footer>
+    </main>
+    <script type="module" src="./app.js"></script>
+  </body>
+</html>

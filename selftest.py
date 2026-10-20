@@ -51,7 +51,7 @@ import sys
 import tempfile
 import time
 from pathlib import Path
-from types import SimpleNamespace
+from types import MappingProxyType, SimpleNamespace
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 if str(_REPO_ROOT) not in sys.path:
@@ -62,7 +62,9 @@ if "ASTRBOT_ROOT" not in os.environ:
 
 from data.plugins.astrbot_plugin_0528_v2 import agent_runner as runner_mod
 from data.plugins.astrbot_plugin_0528_v2 import main as own_main
+from data.plugins.astrbot_plugin_0528_v2 import panel as panel_mod
 from data.plugins.astrbot_plugin_0528_v2 import prerequisite as prereq_mod
+from data.plugins.astrbot_plugin_0528_v2 import remote_config as remote_mod
 from data.plugins.astrbot_plugin_0528_v2 import turn_queue as turn_queue_mod
 from data.plugins.astrbot_plugin_0528_v2.acp import commands as acp_commands
 from data.plugins.astrbot_plugin_0528_v2.acp import pool as pool_mod
@@ -4070,6 +4072,624 @@ async def turn_queue_checks():
 
 
 asyncio.run(turn_queue_checks())
+
+# --------------------------------------------------- 17. Web 配置面板
+class _WritableConfig(dict):
+    """带 save_config_async 的假插件配置（真机是 AstrBotConfig）。"""
+
+    def __init__(self, data):
+        super().__init__(data)
+        self.save_calls = 0
+        self.fail_save = False
+
+    async def save_config_async(self):
+        if self.fail_save:
+            raise RuntimeError("disk full")
+        self.save_calls += 1
+        return True
+
+
+class _FakeWebContext:
+    """只记录 register_web_api 的假 context。"""
+
+    def __init__(self):
+        self.registered_web_apis = []
+
+    def register_web_api(self, route, handler, methods, desc):
+        for index, api in enumerate(self.registered_web_apis):
+            if api[0] == route and api[2] == methods:
+                self.registered_web_apis[index] = (route, handler, methods, desc)
+                return
+        self.registered_web_apis.append((route, handler, methods, desc))
+
+
+def _panel_config(**overrides):
+    data = {
+        "enforce_prerequisite": True,
+        "prerequisite_librunner_repo": "cxykevin/astrbot_plugin_librunner",
+        "prerequisite_libi18nject_repo": "cxykevin/astrbot_plugin_libi18nject",
+        "acp_url": "ws://127.0.0.1:7433/acp?key=supersecret",
+        "workspace_template": "/root/alkaid0/{groupid}",
+        "idle_timeout_sec": 1800,
+        "turn_timeout_sec": 900,
+        "echo_events": True,
+        "show_thought": False,
+    }
+    data.update(overrides)
+    return _WritableConfig(data)
+
+
+def _panel_fields(snapshot):
+    return {
+        field["key"]: field
+        for group in snapshot["groups"]
+        for field in group["fields"]
+    }
+
+
+def _new_panel_service(config, *, panel_values=None, after_save=None):
+    return panel_mod.PanelService(
+        config,
+        plugin_name=PLUGIN_NAME,
+        version=PLUGIN_VERSION,
+        panel_config_provider=lambda: panel_values or {},
+        after_save=after_save,
+    )
+
+
+def _remote_current_config():
+    """假 alkaid0 的全局配置：包含各种形状的嵌套 map / 数组 / 秘密。"""
+    return {
+        "$schema": "https://example/schema.json",
+        "Version": "0.6",
+        "Server": {
+            "host": "127.0.0.1",
+            "port": 7433,
+            "key": "real-key",
+            "path": "/acp",
+        },
+        "Model": {
+            "ProviderKey": "sk-global",
+            "ProviderURL": "ws://u:p@example/acp?key=old&x=1",
+            "DefaultModelID": "0",
+            "Models": {
+                "0": {
+                    "ModelName": "demo",
+                    "ModelID": "demo-id",
+                    "ProviderKey": "sk-model",
+                }
+            },
+        },
+        "Agent": {
+            "TerminalEnvs": {"PATH": "/bin", "OPENAI_API_KEY": "sk-env"},
+            "FetchProxy": "http://u:p@proxy:1/",
+            "Fetch": {
+                "RewriteHeaders": {
+                    "^https://x": {"Authorization": "Bearer t", "User-Agent": "ua"}
+                }
+            },
+        },
+        "Context": {
+            "OnlineSearch": {
+                "github": {"token": "ghp_x", "api_key": "ak", "proxy_url": "http://u:p@proxy:2/"}
+            }
+        },
+        "Python": {"Source": "https://u:p@pypi.example/simple"},
+        "DataMask": {"mask_ip_whitelist": ["1.2.3.4"]},
+        "ignoreSignals": False,
+    }
+
+
+class _FakeRemoteClient:
+    """假 ACP 客户端：只实现远程配置服务用到的几个方法。"""
+
+    def __init__(self):
+        self.calls = []
+        self.set_payload = None
+        self.current = _remote_current_config()
+        self.closed = False
+        self.get_count = 0
+        #: 让第 N 次 config/get 抛错（用来模拟「保存成功、回读失败」）。
+        self.fail_get_call = None
+
+    async def connect(self):
+        pass
+
+    async def initialize(self, timeout=None):
+        pass
+
+    async def call(self, method, params, timeout=None):
+        self.calls.append((method, params))
+        if method == remote_mod.METHOD_CONFIG_GET:
+            self.get_count += 1
+            if self.fail_get_call == self.get_count:
+                raise ACPError("回读超时")
+            return {"config": json.loads(json.dumps(self.current))}
+        if method == remote_mod.METHOD_CONFIG_SET:
+            self.set_payload = params["config"]
+            return {}
+        if method == remote_mod.METHOD_CONFIG_RELOAD:
+            return {}
+        raise AssertionError(method)
+
+    async def close(self):
+        self.closed = True
+
+
+def _new_remote_service(client, *, url="ws://127.0.0.1:7433/acp?key=real-key"):
+    return remote_mod.RemoteConfigService(
+        plugin_name=PLUGIN_NAME,
+        url_provider=lambda: url,
+        client_factory=lambda _url, _name: client,
+    )
+
+
+async def remote_checks():
+    """alkaid0 全局配置：脱敏、patch 还原、服务保存与视图 / 路由。"""
+    current = _remote_current_config()
+    schema_path = PLUGIN_DIR / "alkaid0_config_schema.json"
+    check(
+        "打包了 alkaid0 配置 schema",
+        schema_path.is_file()
+        and {"Model", "Agent", "Server"} <= set(remote_mod.load_schema()["properties"]),
+        str(schema_path),
+    )
+
+    masked = remote_mod.mask_config(current)
+    masked_text = json.dumps(masked, ensure_ascii=False)
+    check(
+        "远程配置脱敏：Server.key / ProviderKey / env / 请求头 / 搜索 token 都打码",
+        masked["Server"]["key"] == remote_mod.MASK
+        and masked["Model"]["ProviderKey"] == remote_mod.MASK
+        and masked["Model"]["Models"]["0"]["ProviderKey"] == remote_mod.MASK
+        and masked["Agent"]["TerminalEnvs"]["OPENAI_API_KEY"] == remote_mod.MASK
+        and masked["Agent"]["TerminalEnvs"]["PATH"] == "/bin"
+        and masked["Agent"]["Fetch"]["RewriteHeaders"]["^https://x"]["Authorization"]
+        == remote_mod.MASK
+        and masked["Agent"]["Fetch"]["RewriteHeaders"]["^https://x"]["User-Agent"]
+        == "ua"
+        and masked["Context"]["OnlineSearch"]["github"]["token"] == remote_mod.MASK
+        and masked["Context"]["OnlineSearch"]["github"]["api_key"] == remote_mod.MASK
+        and "real-key" not in masked_text
+        and "sk-global" not in masked_text
+        and "sk-env" not in masked_text
+        and "ghp_x" not in masked_text,
+        masked_text,
+    )
+    unknown_sample = {
+        "Server": {"key": "real-key"},
+        "NewSection": {
+            "api_key": "plain-new-key",
+            "SomeURL": "http://u:p@example/x",
+            "nested": {"token": "plain-new-token"},
+        },
+        "Model": {"Models": {"0": {"ProviderKey": "sk-model"}}},
+        "Agent": {"TerminalEnvs": {"OPENAI_API_KEY": "sk-env"}},
+    }
+    unknown_masked = remote_mod.mask_config(
+        unknown_sample, schema=remote_mod.load_schema()
+    )
+    check(
+        "未在 schema 中的字段默认不敏感（已知字段照常打码）",
+        unknown_masked["NewSection"]["api_key"] == "plain-new-key"
+        and unknown_masked["NewSection"]["SomeURL"] == "http://u:p@example/x"
+        and unknown_masked["NewSection"]["nested"]["token"] == "plain-new-token"
+        and unknown_masked["Server"]["key"] == remote_mod.MASK
+        and unknown_masked["Model"]["Models"]["0"]["ProviderKey"] == remote_mod.MASK
+        and unknown_masked["Agent"]["TerminalEnvs"]["OPENAI_API_KEY"]
+        == remote_mod.MASK,
+        json.dumps(unknown_masked, ensure_ascii=False),
+    )
+    check(
+        "未在 schema 中的路径不会被当成 URL / secret 还原",
+        remote_mod.restore_patch(
+            {"NewSection": {"api_key": "***", "SomeURL": "http://u:p@example/x"}},
+            unknown_sample,
+            schema=remote_mod.load_schema(),
+        )
+        == {"NewSection": {"api_key": "***", "SomeURL": "http://u:p@example/x"}},
+    )
+    check(
+        "远程配置脱敏：URL 只打码 userinfo / 查询参数",
+        "***" in masked["Model"]["ProviderURL"]
+        and "example/acp" in masked["Model"]["ProviderURL"]
+        and "***" in masked["Agent"]["FetchProxy"]
+        and "***" in masked["Python"]["Source"],
+        str(masked["Model"]["ProviderURL"]),
+    )
+
+    restored = remote_mod.restore_patch(
+        {
+            "Server": {"key": "***"},
+            "Model": {"ProviderURL": "ws://new/acp?key=***"},
+            "Agent": {
+                "TerminalEnvs": {"OPENAI_API_KEY": "***", "PATH": "/usr/bin"}
+            },
+        },
+        current,
+    )
+    check(
+        "远程 patch 还原：secret 占位符丢弃、URL 占位符还原、新值保留",
+        restored
+        == {
+            "Server": {},
+            "Model": {"ProviderURL": "ws://new/acp?key=old"},
+            "Agent": {"TerminalEnvs": {"PATH": "/usr/bin"}},
+        }
+        or restored
+        == {
+            "Model": {"ProviderURL": "ws://new/acp?key=old"},
+            "Agent": {"TerminalEnvs": {"PATH": "/usr/bin"}},
+        },
+        str(restored),
+    )
+    check(
+        "远程 patch 还原：整棵子树只有 secret 时不会提交空对象",
+        "Server" not in restored,
+        str(restored),
+    )
+
+    current_with_stale = dict(current)
+    current_with_stale["NewSection"] = {"x": 1}
+    check(
+        "远程 patch 校验：允许 schema 里已有的顶层字段与当前配置里的旧字段",
+        remote_mod.validate_patch(
+            {"Server": {"port": 1}, "NewSection": {"x": 2}},
+            remote_mod.load_schema(),
+            current_with_stale,
+        )
+        is None,
+    )
+    rejected = None
+    try:
+        remote_mod.validate_patch(
+            {"Nope": {"x": 1}}, remote_mod.load_schema(), current
+        )
+    except remote_mod.RemoteConfigError as exc:
+        rejected = exc.code
+    check(
+        "远程 patch 校验：凭空写未知顶层字段会拒绝",
+        rejected == "unknown_field:Nope",
+        str(rejected),
+    )
+
+    client = _FakeRemoteClient()
+    service = _new_remote_service(client)
+    fetched = await service.fetch()
+    check(
+        "远程配置读取：返回脱敏后的配置",
+        fetched["config"]["Server"]["key"] == remote_mod.MASK
+        and "real-key" not in json.dumps(fetched, ensure_ascii=False),
+        json.dumps(fetched["meta"], ensure_ascii=False),
+    )
+    applied = await service.apply(
+        {
+            "Server": {"port": 9999, "key": "***"},
+            "Model": {"ProviderURL": "ws://new/acp?key=***"},
+            "Agent": {
+                "TerminalEnvs": {"OPENAI_API_KEY": "***", "PATH": "/usr/bin"}
+            },
+        }
+    )
+    check(
+        "远程配置保存：只提交改动、还原 URL、secret 不出现在 set 请求里",
+        client.set_payload
+        == {
+            "Server": {"port": 9999},
+            "Model": {"ProviderURL": "ws://new/acp?key=old"},
+            "Agent": {"TerminalEnvs": {"PATH": "/usr/bin"}},
+        }
+        and applied["saved"]
+        == ["Server.port", "Model.ProviderURL", "Agent.TerminalEnvs.PATH"]
+        and applied["config"]["Server"]["key"] == remote_mod.MASK,
+        str(client.set_payload),
+    )
+
+    # 写入已经成功、回读却失败：仍按保存成功返回，并给前端一个 warning。
+    client.fail_get_call = client.get_count + 2
+    warned = await service.apply({"Server": {"port": 10001}})
+    check(
+        "远程配置保存：回读失败不把成功的保存报成失败",
+        warned["warning"] == "refresh_failed"
+        and warned["saved"] == ["Server.port"]
+        and client.set_payload == {"Server": {"port": 10001}},
+        f"{warned['warning']} / {warned['saved']} / {client.set_payload}",
+    )
+    client.fail_get_call = None
+
+    web_context = _FakeWebContext()
+    service.register(web_context)
+    routes = {(api[0], tuple(api[2])) for api in web_context.registered_web_apis}
+    check(
+        "远程配置注册 GET / POST / 重载三个接口",
+        routes
+        == {
+            (f"/{PLUGIN_NAME}/remote/config", ("GET",)),
+            (f"/{PLUGIN_NAME}/remote/config", ("POST",)),
+            (f"/{PLUGIN_NAME}/remote/reload", ("POST",)),
+        },
+        str(web_context.registered_web_apis),
+    )
+    service.unregister(web_context)
+    check("远程配置停用后摘掉自己的接口", web_context.registered_web_apis == [])
+
+    app_js = (PLUGIN_DIR / "views/remote/app.js").read_text(encoding="utf-8")
+    check(
+        "远程配置视图通过 bridge 调用读取 / 保存 / 重载接口",
+        "window.AstrBotPluginView" in app_js
+        and 'apiGet("remote/config")' in app_js
+        and 'apiPost("remote/config"' in app_js
+        and 'apiPost("remote/reload"' in app_js,
+    )
+    check(
+        "远程配置视图的静态资源齐全",
+        all(
+            (PLUGIN_DIR / "views/remote" / name).is_file()
+            for name in ("index.html", "app.js", "style.css")
+        ),
+    )
+
+    for locale in ("zh-CN", "en-US"):
+        translations = json.loads(
+            (PLUGIN_DIR / ".astrbot-plugin/i18n" / f"{locale}.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        check(
+            f"{locale} i18n 有远程配置视图文案",
+            translations["views"]["remote"]["title"]
+            and translations["views"]["remote"]["ui"]["save"]
+            and translations["views"]["remote"]["errors"]["remote_unreachable"],
+            locale,
+        )
+        check(
+            f"{locale} 原「配置面板」标题已改为插件配置（避免和远程配置混淆）",
+            translations["views"]["settings"]["title"]
+            in ("插件配置", "Plugin settings"),
+            translations["views"]["settings"]["title"],
+        )
+
+    remote_plugin = Plugin0528V2(
+        context=None, config={"enforce_prerequisite": False}
+    )
+    check(
+        "插件持有 alkaid0 远程配置服务",
+        isinstance(remote_plugin._remote_config, remote_mod.RemoteConfigService),
+    )
+
+
+async def panel_checks():
+    """Web 配置面板：字段树、脱敏 / 还原、校验、保存与路由注册。"""
+    check(
+        "配置面板覆盖 schema 里全部标量字段",
+        set(panel_mod.FIELD_MAP)
+        == {
+            key
+            for key, entry in schema.items()
+            if entry.get("type") in ("bool", "int", "float", "string", "text")
+        },
+        str(sorted(panel_mod.FIELD_MAP)),
+    )
+    check(
+        "配置面板的 URL 脱敏：查询参数与 userinfo 都打码",
+        panel_mod.mask_url("ws://h/acp?key=abc&x=1")
+        == "ws://h/acp?key=***&x=1"
+        and panel_mod.mask_url("wss://user:pass@h/acp?token=t")
+        == "wss://user:***@h/acp?token=***"
+        and panel_mod.mask_url("https://tok@github.com/a/b")
+        == "https://***@github.com/a/b"
+        and panel_mod.mask_url("cxykevin/repo") == "cxykevin/repo",
+        panel_mod.mask_url("wss://user:pass@h/acp?token=t"),
+    )
+    check(
+        "配置面板保存时把 *** 还原成旧凭证（可以同时改主机 / 其它参数）",
+        panel_mod.restore_masked_url(
+            "ws://h2/acp?key=***&x=2", "ws://h/acp?key=abc&x=1"
+        )
+        == "ws://h2/acp?key=abc&x=2"
+        and panel_mod.restore_masked_url("ws://h/acp?key=***", "ws://h/acp?key=abc")
+        == "ws://h/acp?key=abc",
+    )
+    check(
+        "没有旧凭证可还原时保留 ***（保存会拒绝）",
+        panel_mod._has_unresolved_mask(
+            panel_mod.restore_masked_url("ws://h/acp?key=***", "")
+        ),
+    )
+
+    config = _panel_config()
+    service = _new_panel_service(
+        config, panel_values={"echo_events": False, "acp_url": ""}
+    )
+    snapshot = service.snapshot()
+    fields = _panel_fields(snapshot)
+    check(
+        "面板快照：ACP key 已脱敏、默认值与分组齐全",
+        "supersecret" not in json.dumps(snapshot, ensure_ascii=False)
+        and fields["acp_url"]["value"] == "ws://127.0.0.1:7433/acp?key=***"
+        and fields["acp_url"]["title"] == schema["acp_url"]["description"]
+        and fields["acp_url"]["hint"] == schema["acp_url"]["hint"]
+        and [group["key"] for group in snapshot["groups"]]
+        == ["prerequisites", "connection", "workspace", "chat"],
+        json.dumps(snapshot, ensure_ascii=False),
+    )
+    check(
+        "面板快照：标出执行器面板覆盖的字段",
+        fields["echo_events"]["overridden"] is True
+        and fields["echo_events"]["effective"] is False
+        and fields["idle_timeout_sec"]["overridden"] is False,
+        str(fields["echo_events"]),
+    )
+
+    saved = await service.apply(
+        {
+            "acp_url": "ws://other/acp?key=***&x=2",
+            "idle_timeout_sec": "60",
+            "show_thought": "true",
+        }
+    )
+    check(
+        "面板保存：还原脱敏值、按类型转换、写盘一次",
+        saved.ok
+        and saved.data["saved"]
+        == ["acp_url", "idle_timeout_sec", "show_thought"]
+        and config["acp_url"] == "ws://other/acp?key=supersecret&x=2"
+        and config["idle_timeout_sec"] == 60
+        and config["show_thought"] is True
+        and config.save_calls == 1,
+        f"{saved.code} / {dict(config)}",
+    )
+    check(
+        "面板保存：返回的树也是脱敏后的",
+        "supersecret"
+        not in json.dumps(saved.data["config"], ensure_ascii=False),
+    )
+    reload_saved = await service.apply({"enforce_prerequisite": False})
+    check(
+        "前置插件设置保存后提示需要重载",
+        reload_saved.ok and reload_saved.data["reload_required"] is True,
+        str(reload_saved.data),
+    )
+
+    bad_unknown = await service.apply({"nope": 1})
+    bad_range = await service.apply({"idle_timeout_sec": -1})
+    bad_type = await service.apply({"turn_timeout_sec": "soon"})
+    bad_url = await service.apply({"acp_url": "http://h/acp"})
+    check(
+        "面板保存：未知字段 / 越界 / 类型错 / 非 WebSocket 地址都拒绝",
+        bad_unknown.code == "unknown_field:nope"
+        and bad_range.code == "out_of_range:idle_timeout_sec"
+        and bad_type.code == "invalid_type:turn_timeout_sec"
+        and bad_url.code == "invalid_url:acp_url",
+        f"{bad_unknown.code} / {bad_range.code} / {bad_type.code} / {bad_url.code}",
+    )
+
+    bare_service = _new_panel_service(_panel_config(acp_url="ws://h/acp"))
+    unresolved = await bare_service.apply({"acp_url": "ws://h/acp?key=***"})
+    check(
+        "面板保存：没有旧 key 时拒绝 ***（不把占位符写进配置）",
+        unresolved.code == "unresolved_mask:acp_url",
+        unresolved.code,
+    )
+
+    failing = _panel_config()
+    failing_service = _new_panel_service(failing)
+    failing.fail_save = True
+    before_timeout = failing["turn_timeout_sec"]
+    failed = await failing_service.apply({"turn_timeout_sec": 30})
+    check(
+        "面板保存失败：如实报错并回滚内存",
+        failed.code == "save_failed"
+        and failing["turn_timeout_sec"] == before_timeout,
+        f"{failed.code} / {failing['turn_timeout_sec']}",
+    )
+
+    readonly_service = _new_panel_service(
+        MappingProxyType({"idle_timeout_sec": 1})
+    )
+    readonly = await readonly_service.apply({"idle_timeout_sec": 2})
+    check("只读配置拒绝写入", readonly.code == "not_writable", readonly.code)
+
+    no_save_service = _new_panel_service({"idle_timeout_sec": 1})
+    no_save = await no_save_service.apply({"idle_timeout_sec": 2})
+    check(
+        "配置对象没有 save_config 时如实报错并回滚",
+        no_save.code == "save_failed"
+        and no_save_service.config["idle_timeout_sec"] == 1,
+        no_save.code,
+    )
+
+    reloading = _new_panel_service(
+        _panel_config(), after_save=lambda changed: "enforce_prerequisite" in changed
+    )
+    reload_result = await reloading.apply({"enforce_prerequisite": False})
+    check(
+        "面板保存后的回调可以要求重载插件",
+        reload_result.ok and reload_result.data["reload_required"] is True,
+        str(reload_result.data),
+    )
+
+    web_context = _FakeWebContext()
+    service.register(web_context)
+    routes = {(api[0], tuple(api[2])) for api in web_context.registered_web_apis}
+    check(
+        "面板注册 GET / POST 两个接口",
+        routes
+        == {
+            (f"/{PLUGIN_NAME}/panel/config", ("GET",)),
+            (f"/{PLUGIN_NAME}/panel/config", ("POST",)),
+        },
+        str(web_context.registered_web_apis),
+    )
+    service.unregister(web_context)
+    check("面板停用后摘掉自己的接口", web_context.registered_web_apis == [])
+
+    for locale in ("zh-CN", "en-US"):
+        translations = json.loads(
+            (PLUGIN_DIR / ".astrbot-plugin/i18n" / f"{locale}.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        check(
+            f"{locale} i18n 覆盖全部配置字段与视图文案",
+            all(
+                key in translations.get("config", {})
+                and translations["config"][key].get("description")
+                for key in panel_mod.FIELD_MAP
+            )
+            and translations["views"]["settings"]["title"]
+            and translations["views"]["settings"]["ui"]["save"],
+            locale,
+        )
+
+    app_js = (PLUGIN_DIR / "views/settings/app.js").read_text(encoding="utf-8")
+    check(
+        "可视化视图通过 bridge 调用两个面板接口",
+        "window.AstrBotPluginView" in app_js
+        and 'apiGet("panel/config")' in app_js
+        and 'apiPost("panel/config"' in app_js,
+    )
+    check(
+        "可视化视图的静态资源齐全",
+        all(
+            (PLUGIN_DIR / "views/settings" / name).is_file()
+            for name in ("index.html", "app.js", "style.css")
+        ),
+    )
+
+    panel_plugin = Plugin0528V2(context=None, config={"enforce_prerequisite": False})
+    check(
+        "插件持有配置面板服务",
+        isinstance(panel_plugin._panel, panel_mod.PanelService),
+    )
+    panel_plugin._pool = pool_mod.SessionPool(
+        client_factory=lambda url, name: None, idle_timeout=300
+    )
+    changed_ok = await panel_plugin._after_panel_save({"idle_timeout_sec": 120})
+    check(
+        "面板保存后同步连接池空闲阈值",
+        changed_ok is False and panel_plugin._pool.idle_timeout == 120,
+        str(panel_plugin._pool.idle_timeout),
+    )
+    changed_zero = await panel_plugin._after_panel_save({"idle_timeout_sec": 0})
+    check(
+        "面板保存 0 会关闭空闲回收（不是忽略）",
+        changed_zero is False and panel_plugin._pool.idle_timeout == 0,
+        str(panel_plugin._pool.idle_timeout),
+    )
+    check(
+        "前置插件设置保存后要求重载",
+        await panel_plugin._after_panel_save({"enforce_prerequisite": False}) is True,
+    )
+    await panel_plugin._shutdown_pool()
+    check(
+        "main.mask_url 仍转调面板的脱敏实现",
+        own_main.mask_url("ws://h/acp?key=x") == "ws://h/acp?key=***",
+    )
+
+
+asyncio.run(panel_checks())
+asyncio.run(remote_checks())
 
 print()
 if FAILURES:

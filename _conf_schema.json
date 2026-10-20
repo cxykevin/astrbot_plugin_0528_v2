@@ -27,13 +27,13 @@
         "description": "工作目录模板",
         "type": "string",
         "default": "/root/alkaid0/{groupid}",
-        "hint": "一个群一个工作目录。支持 {groupid}（群号；私聊没有群号时用会话号）、{sessionid}、{platform}，不认识的占位符原样保留。目录需要在 alkaid0 侧已存在（session/new 不会创建目录）。同样以执行器面板为准。"
+        "hint": "一个群一个工作目录。支持 {groupid}（群号；私聊没有群号时用会话号）、{sessionid}、{platform}，不认识的占位符原样保留。模板根（第一个占位符之前那段）需要在 alkaid0 侧已存在，渲染出的子目录会自动创建（fs/mkdir）。同样以执行器面板为准。"
     },
     "idle_timeout_sec": {
         "description": "群空闲回收秒数",
         "type": "int",
         "default": 1800,
-        "hint": "一个群这么久没有消息，就结束它的 ACP 会话并断开连接（下次来消息再重建连接与新会话）；0 表示不自动回收。以执行器面板为准。"
+        "hint": "一个群这么久没有消息，就结束它的 ACP 会话并断开连接；下次来消息会续接记录里的会话（不回放历史）。0 表示不自动回收。以执行器面板为准。"
     },
     "turn_timeout_sec": {
         "description": "单轮最大等待秒数",

@@ -1,0 +1,216 @@
+{
+  "metadata": {
+    "display_name": "0528 v2 · Alkaid0 Relay",
+    "short_desc": "Relay AstrBot group chats to the Alkaid0 coding agent.",
+    "desc": "Hands AstrBot messages to the Alkaid0 coding agent: registers the alkaid0 runner, keeps one ACP v2 (WebSocket) connection and session per group, reclaims idle connections, and auto-installs the two prerequisite plugins (astrbot_plugin_librunner / astrbot_plugin_libi18nject) at startup."
+  },
+  "config": {
+    "enforce_prerequisite": {
+      "description": "Enforce prerequisite plugins (disable this plugin if missing)",
+      "hint": "This plugin depends on astrbot_plugin_librunner (runner injection) and astrbot_plugin_libi18nject (WebUI text injection). When enabled, startup checks both prerequisites, installs missing ones with gh/git clone and activates them in place without restarting AstrBot. If installation fails, this plugin is disabled and the reason appears under failed plugins. When disabled, the plugin still starts without the prerequisites (some features may be unavailable)."
+    },
+    "prerequisite_librunner_repo": {
+      "description": "Prerequisite source: librunner",
+      "hint": "GitHub owner/repo or a full git URL used to install astrbot_plugin_librunner (useful for mirrors or intranet hosts). Only used when the prerequisite is missing and enforcement is enabled."
+    },
+    "prerequisite_libi18nject_repo": {
+      "description": "Prerequisite source: libi18nject",
+      "hint": "GitHub owner/repo or a full git URL used to install astrbot_plugin_libi18nject (useful for mirrors or intranet hosts). It is a prerequisite of librunner and is installed first."
+    },
+    "acp_url": {
+      "description": "Alkaid0 ACP URL (WebSocket)",
+      "hint": "For example ws://127.0.0.1:7433/acp?key=<key> (authentication uses the key query parameter). This is only the fallback: values in the runner panel (AI → Agent execution → Alkaid0) take precedence."
+    },
+    "workspace_template": {
+      "description": "Working directory template",
+      "hint": "One working directory per group. Supports {groupid} (group ID, or session ID in private chats), {sessionid} and {platform}; unknown placeholders are kept as-is. The template root (the part before the first placeholder) must already exist on the Alkaid0 side; rendered subdirectories are created automatically (fs/mkdir). The runner panel takes precedence."
+    },
+    "idle_timeout_sec": {
+      "description": "Group idle timeout (seconds)",
+      "hint": "After this much inactivity, close the group's ACP session and disconnect; the next message resumes the recorded session (no history replay). 0 disables automatic reclaim. The runner panel takes precedence."
+    },
+    "turn_timeout_sec": {
+      "description": "Max wait per turn (seconds)",
+      "hint": "How long to wait for state_update idle after submitting a prompt; exceeding it is reported as an error. The runner panel takes precedence."
+    },
+    "echo_events": {
+      "description": "Echo progress events (tool calls / sub-agents / background tasks)",
+      "hint": "Send Alkaid0 progress events to the chat: tool calls (with status and background task ID), sub-agent switches, and background task completion. Each status is sent once; streaming previews are not echoed. When disabled, only the final answer is sent (tool approval prompts are not affected). The runner panel takes precedence."
+    },
+    "show_thought": {
+      "description": "Send reasoning/thoughts to the chat",
+      "hint": "When enabled, agent_thought(_chunk) updates are sent as reasoning message chains. The runner panel takes precedence."
+    }
+  },
+  "views": {
+    "settings": {
+      "title": "Plugin settings",
+      "description": "Browse and edit this plugin's AstrBot settings. For alkaid0's global config, open the \"Alkaid0 global settings\" view.",
+      "groups": {
+        "prerequisites": {
+          "title": "Prerequisites",
+          "description": "Manage the two prerequisite plugins: librunner (runner injection) and libi18nject (WebUI text)."
+        },
+        "connection": {
+          "title": "Connection and timeouts",
+          "description": "Alkaid0 ACP URL, group idle reclaim and per-turn timeout."
+        },
+        "workspace": {
+          "title": "Working directory",
+          "description": "One working directory per group; supports {groupid} / {sessionid} / {platform} placeholders."
+        },
+        "chat": {
+          "title": "Chat echo",
+          "description": "Control whether progress events and reasoning are sent to the chat."
+        },
+        "other": {
+          "title": "Other",
+          "description": "Configuration items that are not grouped yet."
+        }
+      },
+      "ui": {
+        "title": "Configuration panel",
+        "subtitle": "Browse and edit 0528 v2 plugin settings as a tree.",
+        "expand_all": "Expand all",
+        "collapse_all": "Collapse all",
+        "reload": "Reload",
+        "save": "Save",
+        "loading": "Loading configuration…",
+        "saving": "Saving…",
+        "saved": "Saved {n} item(s).",
+        "no_changes": "Nothing to save.",
+        "unsaved": "{n} unsaved change(s).",
+        "on": "On",
+        "off": "Off",
+        "show": "Show",
+        "hide": "Hide",
+        "reset_default": "Reset to default",
+        "default_value": "Default",
+        "effective_value": "Effective",
+        "panel_value": "Runner panel",
+        "badge_reload": "Reload needed",
+        "badge_reload_hint": "Takes effect after reloading the plugin.",
+        "badge_override": "Overridden by runner panel",
+        "badge_override_hint": "The runner panel value wins; clear it there to let this value take effect.",
+        "badge_masked": "Sensitive field",
+        "masked_short": "*** means masked; saving keeps the original value",
+        "masked_hint": "*** keeps the original value; editing the host, path or other parameters will not touch credentials.",
+        "override_banner": "Values in the runner panel (AI → Agent execution → Alkaid0) take precedence over plugin configuration; fields marked \"Overridden by runner panel\" will not take effect when changed here.",
+        "reload_warning": "Prerequisite settings were saved and require a plugin reload to take effect.",
+        "empty": "No editable configuration items.",
+        "empty_group": "This group has no configuration items yet."
+      },
+      "errors": {
+        "bad_payload": "Invalid request payload.",
+        "bad_response": "The configuration endpoint returned an unexpected response.",
+        "no_changes": "Nothing to save.",
+        "unknown_field": "Unknown configuration item: {field}",
+        "invalid_type": "Invalid type for \"{field}\".",
+        "out_of_range": "\"{field}\" is out of range.",
+        "too_long": "\"{field}\" is too long.",
+        "invalid_url": "\"{field}\" is not a valid WebSocket URL (ws:// or wss:// required).",
+        "unresolved_mask": "\"{field}\" contains *** with no original value to restore; enter the full value.",
+        "not_writable": "The plugin configuration is not writable.",
+        "save_failed": "Failed to write the configuration file; check the AstrBot logs.",
+        "bridge_unavailable": "AstrBot plugin page bridge not found; open this view from the plugin page.",
+        "bridge_timeout": "Timed out connecting to the Dashboard; reopen this view from the plugin page.",
+        "unknown": "Operation failed: {detail}"
+      }
+    },
+    "remote": {
+      "title": "Alkaid0 global settings",
+      "description": "Read and edit alkaid0's global configuration directly; only changed fields are submitted and secrets are masked.",
+      "ui": {
+        "title": "Alkaid0 global settings",
+        "subtitle": "Read and edit alkaid0's global configuration directly. Only changed fields are submitted; sensitive values are masked.",
+        "tree": "Tree",
+        "json": "JSON",
+        "expand_all": "Expand all",
+        "collapse_all": "Collapse all",
+        "reload": "Reload",
+        "reload_remote": "Reload from disk",
+        "save": "Save",
+        "loading": "Reading configuration from alkaid0…",
+        "saving": "Saving…",
+        "saved": "Saved {n} item(s).",
+        "saved_refresh_failed": "Saved, but the read-back failed. Click Reload to verify.",
+        "no_changes": "No changes to save.",
+        "unsaved": "{n} unsaved change(s).",
+        "masked_short": "*** means masked; untouched secrets are never submitted.",
+        "server": "Remote",
+        "readonly": "Read-only",
+        "secret": "Secret",
+        "restart": "Restart",
+        "readonly_hint": "Read-only field",
+        "secret_hint": "Secret value masked",
+        "url_hint": "URL credentials are masked",
+        "secret_leaf_hint": "*** keeps the original value; this field is not submitted unless changed.",
+        "url_leaf_hint": "When you only change the host/path, *** query values are restored automatically.",
+        "default": "Default",
+        "undo": "Undo",
+        "delete": "Delete",
+        "add": "Add",
+        "add_item": "Add item",
+        "new_key": "New key",
+        "key_name": "Key",
+        "key_exists": "That key already exists.",
+        "value": "Value",
+        "entries": "Entries",
+        "other_entries": "Other entries",
+        "unknown_fields": "Fields not in the schema",
+        "empty": "empty",
+        "empty_object": "This object has no fields yet.",
+        "empty_array": "No items yet.",
+        "empty_map": "No entries yet.",
+        "not_set": "Not set; edit to create it on save.",
+        "on": "On",
+        "off": "Off",
+        "masked": "masked",
+        "item_count": "{n} item(s)",
+        "field_count": "{n} field(s)",
+        "move_up": "Up",
+        "move_down": "Down",
+        "show": "Show",
+        "hide": "Hide",
+        "retry": "Retry",
+        "cancel": "Cancel",
+        "confirm": "Confirm",
+        "json_unapplied": "The JSON editor has unapplied changes.",
+        "json_applied": "JSON applied to the draft; not saved yet.",
+        "json_synced": "Restored from the current draft.",
+        "json_hint": "This edits the full draft. Click Save to write it to alkaid0. $schema is never submitted.",
+        "apply_json": "Apply JSON",
+        "format_json": "Format",
+        "sync_json": "Discard edits",
+        "json_value_invalid": "This must be valid JSON: {detail}",
+        "refresh_failed": "Saved, but the read-back failed. Click Reload to verify.",
+        "restart_warning": "These fields need an alkaid0 restart: {paths}. Restart alkaid0 after saving.",
+        "key_warning": "After changing Server.key, update the runner panel / plugin settings with the new ACP URL too.",
+        "restart_confirm": "These fields need an alkaid0 restart: {paths}.\nRestart alkaid0 after saving. Save anyway?",
+        "key_confirm": "Note: after changing Server.key, update the runner panel / plugin settings with the new ACP URL, or the next message will fail authentication.",
+        "discard_confirm": "There are unsaved changes. Reloading will discard them. Continue?",
+        "reload_remote_confirm": "Ask alkaid0 to reload its configuration from disk? This overwrites the current in-memory values.",
+        "reloaded": "Reloaded alkaid0 configuration from disk."
+      },
+      "errors": {
+        "bad_payload": "Invalid request payload.",
+        "bad_response": "The remote configuration API returned unrecognized data.",
+        "bad_config": "alkaid0 returned an unrecognized config/get structure.",
+        "no_changes": "No changes to save.",
+        "unknown_field": "Unknown setting: {detail}",
+        "unresolved_mask": "\"{detail}\" still contains *** with no original value; enter the full value.",
+        "too_large": "The submitted payload is too large.",
+        "remote_unconfigured": "No Alkaid0 ACP URL is configured. Set it in the runner panel or plugin settings first.",
+        "remote_unreachable": "Cannot reach alkaid0: {detail}",
+        "remote_timeout": "Timed out waiting for alkaid0.",
+        "remote_unsupported": "This alkaid0 version does not support remote configuration (config/get|set|reload).",
+        "remote_error": "alkaid0 returned an error: {detail}",
+        "bridge_unavailable": "AstrBot plugin-view bridge not found. Open this view from the plugin page.",
+        "bridge_timeout": "Timed out connecting to the Dashboard. Reopen this view from the plugin page.",
+        "json_parse": "JSON syntax error: {detail}",
+        "json_object_required": "The JSON top level must be an object.",
+        "unknown": "Operation failed: {detail}"
+      }
+    }
+  }
+}
