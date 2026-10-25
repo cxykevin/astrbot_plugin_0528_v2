@@ -541,6 +541,34 @@ class ACPClient:
             acp.METHOD_SESSION_CLOSE, {"sessionId": session_id}, timeout=timeout
         )
 
+    async def cron_list(
+        self, session_id: str, *, timeout: float | None = None
+    ) -> dict:
+        """列出当前连接绑定的会话里的定时任务（``session/cron/list``）。
+
+        Returns:
+            ``{"jobs": [{id, cron, prompt, runOnce, workdir, nextRuns}, ...]}``。
+        """
+        return await self.call(
+            acp.METHOD_CRON_LIST,
+            {"sessionId": session_id},
+            timeout=timeout,
+        )
+
+    async def cron_delete(
+        self, session_id: str, job_id: int, *, timeout: float | None = None
+    ) -> dict:
+        """删除当前连接绑定的会话里的一条定时任务（``session/cron/delete``）。
+
+        Returns:
+            服务端响应（成功时是 ``{"id": <id>}``）。
+        """
+        return await self.call(
+            acp.METHOD_CRON_DELETE,
+            {"sessionId": session_id, "id": int(job_id)},
+            timeout=timeout,
+        )
+
     async def fs_mkdir(
         self, session_id: str, path: str, *, timeout: float | None = None
     ) -> T.Any:

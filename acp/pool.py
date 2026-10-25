@@ -35,8 +35,35 @@ from .store import SessionStore
 #: 没有配置空闲时间时的默认值（秒）。
 DEFAULT_IDLE_TIMEOUT_SEC = 1800.0
 
+#: 唤醒钩子判断「会话已经开始往外推内容」的事件类型。
+#:
+#: 开会话 / 续接时会顺带推 ``available_commands_update`` / ``config_option_update``，
+#: 那些只是会话元数据，不能算「收到消息」；这里只认一轮对话真正产生的事件。
+DELIVERY_UPDATE_KINDS = frozenset(
+    {
+        acp.UPDATE_USER_MESSAGE,
+        acp.UPDATE_USER_MESSAGE_CHUNK,
+        acp.UPDATE_AGENT_MESSAGE,
+        acp.UPDATE_AGENT_MESSAGE_CHUNK,
+        acp.UPDATE_AGENT_THOUGHT,
+        acp.UPDATE_AGENT_THOUGHT_CHUNK,
+        acp.UPDATE_TOOL_CALL,
+        acp.UPDATE_STATE,
+        acp.UPDATE_PLAN,
+        acp.UPDATE_USAGE,
+        acp.UPDATE_SUMMARY,
+        acp.UPDATE_TERMINAL,
+        acp.UPDATE_SHELL_STOP,
+        acp.UPDATE_REWIND,
+    }
+)
+
 #: 客户端工厂：``(url, name) -> ACPClient``（未连接状态）。测试可注入替身。
 ClientFactory = T.Callable[[str, str], ACPClient]
+
+#: 审批处理函数工厂：``(GroupSession) -> handler``；连接池建好每条会话就装上，
+#: 这样本地回合、主动推送、外部唤醒钩子走的是同一套自动批准 / 挂起逻辑。
+PermissionHandlerFactory = T.Callable[["GroupSession"], T.Any]
 
 #: 日志前缀（与插件其它模块一致）。
 LOG_PREFIX = "0528v2"
@@ -86,12 +113,34 @@ class GroupSession:
     available_commands: list[dict] = field(default_factory=list)
     #: 最近一次 ``usage_update`` 的上下文用量 ``(used, size)``；还没收到时是 None。
     usage: tuple[int, int] | None = None
+    #: 本轮提示词里带的自动批准授权（只在本轮有效，回合结束清掉）。
+    prompt_grant: T.Any = None
+    #: 外部钩子（cron 唤醒等）带来的自动批准授权（带过期时间）。
+    external_grant: T.Any = None
+    #: 外部授权的过期时刻（``time.monotonic()``）；``0`` 表示没有授权。
+    external_grant_expires: float = 0.0
+    #: 自动批准的序号：每自动批准一次 +1，回合循环据此判断是否要发「等待审批」提示。
+    approval_seq: int = 0
+    #: 最近一次自动批准的摘要（工具名 / 来源 / 时间）。
+    last_approval: dict | None = None
+    #: 已经收到的「对话内容」更新条数（唤醒钩子用它判断消息是否真的送达）。
+    delivery_seq: int = 0
+    #: 最近一条对话内容更新的 ``sessionUpdate`` 类型。
+    last_update_kind: str = ""
+    #: 外部 relay（唤醒钩子）正在消费这一轮：主动推送不要重复处理。
+    external_relay: bool = False
+    #: 常驻主动推送正在收集一轮（cron / 其它客户端发起）：回收任务要跳过。
+    proactive_active: bool = False
     #: 是否已经挂上配置项监听（内部标记，避免重复订阅）。
     _config_listening: bool = field(default=False, repr=False)
+    #: 是否已经挂上送达计数监听（内部标记，避免重复订阅）。
+    _delivery_listening: bool = field(default=False, repr=False)
     #: 是否已经挂上命令列表监听（内部标记，避免重复订阅）。
     _commands_listening: bool = field(default=False, repr=False)
     #: 是否已经挂上用量监听（内部标记，避免重复订阅）。
     _usage_listening: bool = field(default=False, repr=False)
+    #: 是否已经挂上主动推送监听（内部标记，避免重复订阅）。
+    _proactive_listening: bool = field(default=False, repr=False)
 
     @property
     def connected(self) -> bool:
@@ -101,7 +150,7 @@ class GroupSession:
     @property
     def busy(self) -> bool:
         """是否正在跑一轮对话（回收任务会跳过）。"""
-        return self.lock.locked()
+        return self.lock.locked() or self.proactive_active
 
     def idle_seconds(self) -> float:
         """距上次活动过了多少秒。"""
@@ -132,6 +181,38 @@ class GroupSession:
             acp_commands.CAPABILITY_ALKAID0_V04,
         )
 
+    @property
+    def supports_cron(self) -> bool:
+        """服务端是否声明了定时任务能力（``alk.cxykevin.top/cron``）。"""
+        return acp_commands.has_capability(
+            getattr(self.client, "server_info", None),
+            acp.CAPABILITY_CRON,
+        )
+
+    async def cron_jobs(self) -> list[dict]:
+        """列出本会话的定时任务（``session/cron/list``，见扩展文档 §3.11）。
+
+        Returns:
+            任务列表（``id`` / ``cron`` / ``prompt`` / ``runOnce`` / ``workdir`` /
+            ``nextRuns``）；形状不对的条目会被跳过。
+        """
+        session_id = await self.ensure_session()
+        result = await self.client.cron_list(session_id)
+        self.touch()
+        jobs = result.get("jobs") if isinstance(result, dict) else None
+        return [job for job in jobs or [] if isinstance(job, dict)]
+
+    async def delete_cron_job(self, job_id: int) -> dict:
+        """删除本会话的一条定时任务（只影响自己的工作目录 + 会话）。
+
+        Raises:
+            ACPError: 会话不可用，或任务不属于本会话 / 已经被删掉。
+        """
+        session_id = await self.ensure_session()
+        result = await self.client.cron_delete(session_id, job_id)
+        self.touch()
+        return result if isinstance(result, dict) else {}
+
     async def set_config_option(
         self, config_id: str, value: str, *, type: str = acp.CONFIG_TYPE_SELECT
     ) -> dict:
@@ -156,6 +237,41 @@ class GroupSession:
         options = acp.config_options_of(payload)
         if options:
             self.config_options = options
+
+    # ── 自动批准授权（提示词 / 外部钩子）───────────────
+    def set_prompt_grant(self, grant: T.Any) -> None:
+        """记下本轮提示词里的自动批准授权（空授权也要记，覆盖上一轮）。"""
+        self.prompt_grant = grant
+
+    def clear_prompt_grant(self) -> None:
+        """清掉本轮提示词授权（回合结束 / 异常收尾都调用）。"""
+        self.prompt_grant = None
+
+    def set_external_grant(self, grant: T.Any, *, ttl: float) -> None:
+        """记下外部钩子的自动批准授权，并设置过期时间（秒）。"""
+        names = getattr(grant, "names", frozenset()) if grant is not None else frozenset()
+        all_tools = bool(getattr(grant, "all_tools", False)) if grant is not None else False
+        if not names and not all_tools:
+            self.clear_external_grant()
+            return
+        self.external_grant = grant
+        self.external_grant_expires = time.monotonic() + max(1.0, float(ttl))
+
+    def active_external_grant(self) -> T.Any:
+        """取当前有效的外部授权；过期 / 没设置时返回空授权。"""
+        from .approval import EMPTY_GRANT
+
+        if self.external_grant is None or self.external_grant_expires <= 0:
+            return EMPTY_GRANT
+        if time.monotonic() >= self.external_grant_expires:
+            self.clear_external_grant()
+            return EMPTY_GRANT
+        return self.external_grant
+
+    def clear_external_grant(self) -> None:
+        """清掉外部钩子的自动批准授权。"""
+        self.external_grant = None
+        self.external_grant_expires = 0.0
 
     def _remember_commands(self, payload: T.Any) -> None:
         """记下服务端下发的命令列表（只认 ``available_commands_update``）。
@@ -241,6 +357,68 @@ class GroupSession:
 
         self.client.subscribe(_on_notification)
 
+    def watch_deliveries(self) -> None:
+        """开始统计这个会话收到的对话内容更新（幂等）。
+
+        唤醒钩子在 ``session/resume`` **之前**调用：服务端会先补发正在流式输出的
+        消息快照，再继续推后续 chunk —— 监听挂晚了就会把「已经送到」误判成没送到。
+        """
+        self._listen_delivery()
+
+    def _listen_delivery(self) -> None:
+        """订阅通知，给「真的有对话内容送达」计数（幂等）。
+
+        只认 :data:`DELIVERY_UPDATE_KINDS` 里的事件；``available_commands_update`` /
+        ``config_option_update`` 这类开会话时顺带推的元数据不算。只统计当前会话的更新
+        （``sessionId`` 对不上就忽略，防止别的会话串进来）。
+        """
+        if self._delivery_listening:
+            return
+        self._delivery_listening = True
+
+        def _on_notification(_method: str, params: dict) -> None:
+            update = params.get("update") if isinstance(params, dict) else None
+            if not isinstance(update, dict):
+                return
+            update_session = update.get("sessionId") or (
+                params.get("sessionId") if isinstance(params, dict) else None
+            )
+            if (
+                isinstance(update_session, str)
+                and update_session
+                and self.session_id
+                and update_session != self.session_id
+            ):
+                # 广播里带的是别的会话（同一条连接上不该发生，防御一下）
+                return
+            kind = update.get("sessionUpdate")
+            if not isinstance(kind, str) or kind not in DELIVERY_UPDATE_KINDS:
+                return
+            self.delivery_seq += 1
+            self.last_update_kind = kind
+
+        self.client.subscribe(_on_notification)
+
+    async def wait_delivery(
+        self, after_seq: int, timeout: float
+    ) -> tuple[bool, str]:
+        """等这个会话再送出一条对话内容更新。
+
+        Args:
+            after_seq: 调用方记下的起始计数（:attr:`delivery_seq`）。
+            timeout: 最多等多少秒；``<= 0`` 时只检查一次。
+
+        Returns:
+            ``(是否等到了, 最后一条更新的类型)``。超时返回 ``(False, 已知类型)``。
+        """
+        deadline = time.monotonic() + max(0.0, float(timeout))
+        while self.delivery_seq <= after_seq:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return False, self.last_update_kind
+            await asyncio.sleep(min(0.05, remaining))
+        return True, self.last_update_kind
+
     async def ensure_session(self) -> str:
         """确保连接可用且存在活跃 ACP 会话，返回 ``sessionId``。
 
@@ -261,12 +439,63 @@ class GroupSession:
             self._listen_config_options()
             self._listen_available_commands()
             self._listen_usage()
+            self._listen_delivery()
 
         if self.session_id is None:
             self.session_id = await self._open_session()
 
         self.touch()
         return self.session_id
+
+    async def ensure_existing(self, session_id: str) -> str:
+        """续接一个**已经存在**的会话，绝不退回 ``session/new``。
+
+        唤醒钩子专用：会话记录就指向 ``session_id``，这里只负责把连接建好并
+        ``session/resume`` 它。续接失败（会话被删 / cwd 对不上）就原样抛错，
+        不会悄悄开一个新会话把记录覆盖掉。
+
+        Args:
+            session_id: 要续接的完整会话 ID（``sess_<号>:<cwd>``）。
+
+        Returns:
+            续接后的会话 ID（就是传入的 ``session_id``）。
+
+        Raises:
+            ACPError: 建连、握手失败，或服务端拒绝续接；连接已经绑在**另一个**
+                会话上时也抛错（不能把别人正在用的会话挤掉）。
+        """
+        if not self.client.connected:
+            self.session_id = None
+            await self.client.connect()
+            await self.client.initialize()
+            # 同 ensure_session：先挂监听，别错过续接时的快照与广播
+            self._listen_config_options()
+            self._listen_available_commands()
+            self._listen_usage()
+            self._listen_delivery()
+
+        if self.session_id is not None and self.session_id != session_id:
+            raise ACPError(
+                f"{self.key}：连接已绑定会话 {self.session_id}，不能改去唤醒 {session_id}"
+            )
+        if self.session_id == session_id:
+            self.touch()
+            return session_id
+
+        result = await self.client.session_resume(session_id, self.cwd)
+        self.session_id = session_id
+        # 换了（续接了）会话：旧的用量不属于它
+        self.usage = None
+        self._remember_config_options(result)
+        self.touch()
+        logger.info(
+            "%s: 群 %s 已唤醒 ACP 会话 %s（工作目录 %s，不回放历史）",
+            LOG_PREFIX,
+            self.key,
+            session_id,
+            self.cwd,
+        )
+        return session_id
 
     async def _open_session(self) -> str:
         """拿到本群该用的会话 ID：优先按记录续接，否则新开并记账。
@@ -438,6 +667,10 @@ class SessionPool:
         self._sessions: dict[str, GroupSession] = {}
         self._lock = asyncio.Lock()
         self._reaper_task: asyncio.Task[None] | None = None
+        #: 新连接对象创建时的回调（主动推送用它挂常驻监听）。
+        self._session_listener: T.Callable[[GroupSession], None] | None = None
+        #: 审批处理函数工厂：每条会话建好就装上，外部回合也能自动批准 / 挂起。
+        self._permission_handler_factory: PermissionHandlerFactory | None = None
 
     # ── 查询 ─────────────────────────────────────────────
     def __len__(self) -> int:
@@ -470,6 +703,47 @@ class SessionPool:
         """
         self.idle_timeout = max(0.0, float(seconds))
 
+    def set_session_listener(
+        self, listener: T.Callable[[GroupSession], None] | None
+    ) -> None:
+        """给「新连接对象」挂一个回调，并把已有的连接也补挂一遍。
+
+        主动推送用它订阅每条连接的 ``session/update``：不建连、不发请求，
+        只监听服务端主动推来的内容（cron 唤醒等没有本地 prompt 的回合）。
+        """
+        self._session_listener = listener
+        if listener is None:
+            return
+        for session in list(self._sessions.values()):
+            listener(session)
+
+    def set_permission_handler_factory(
+        self, factory: PermissionHandlerFactory | None
+    ) -> None:
+        """设置审批处理函数工厂，并给已有 / 之后新建的连接都装上。
+
+        自动批准不能只装在「本地回合」上：cron 唤醒、其它客户端发起的回合没有
+        ``agent_runner._run_gated`` 这段代码，必须由连接池统一兜底。
+        """
+        self._permission_handler_factory = factory
+        if factory is None:
+            return
+        for session in list(self._sessions.values()):
+            self._install_permission_handler(session)
+
+    def _install_permission_handler(self, session: GroupSession) -> None:
+        """把工厂产出的处理函数装到一条会话上（失败只记日志）。"""
+        factory = self._permission_handler_factory
+        if factory is None:
+            return
+        try:
+            handler = factory(session)
+            session.client.set_permission_handler(handler)
+        except Exception as exc:  # noqa: BLE001 - 装不上就退回默认「拒绝」
+            logger.warning(
+                "%s: 给群 %s 装审批处理函数失败：%s", LOG_PREFIX, session.key, exc
+            )
+
     @property
     def reaper_running(self) -> bool:
         """后台空闲回收任务是否在跑。"""
@@ -499,6 +773,18 @@ class SessionPool:
         Raises:
             ACPError: 建连或开会话失败（失败的连接不会留在池子里）。
         """
+        session = await self._get_or_create(key, url=url, cwd=cwd, cwd_root=cwd_root)
+        try:
+            await session.ensure_session()
+        except Exception:
+            await self._drop(key, session, reason="建立会话失败")
+            raise
+        return session
+
+    async def _get_or_create(
+        self, key: str, *, url: str, cwd: str, cwd_root: str = ""
+    ) -> GroupSession:
+        """取得（或新建）该群的连接对象，但**不**建连、不建会话。"""
         stale: GroupSession | None = None
         async with self._lock:
             session = self._sessions.get(key)
@@ -524,11 +810,34 @@ class SessionPool:
                         cwd_root=cwd_root,
                     )
                     self._sessions[key] = session
+                    if self._session_listener is not None:
+                        self._session_listener(session)
+                    self._install_permission_handler(session)
+        return session
 
+    async def prepare(
+        self, key: str, *, url: str, cwd: str, cwd_root: str = ""
+    ) -> GroupSession:
+        """取得连接对象但不建连（唤醒钩子要在续接前挂监听，见 :meth:`acquire_existing`）。"""
+        return await self._get_or_create(key, url=url, cwd=cwd, cwd_root=cwd_root)
+
+    async def acquire_existing(
+        self, key: str, *, url: str, cwd: str, session_id: str
+    ) -> GroupSession:
+        """唤醒一个**已经存在**的会话（``session/resume``，绝不 ``session/new``）。
+
+        与 :meth:`acquire` 的区别：这里只认传入的 ``session_id``，续接失败就抛错，
+        不会顺手开一个新会话把记录覆盖掉。
+
+        Raises:
+            ACPError: 建连 / 续接失败，或连接已经绑在别的会话上。
+        """
+        session = await self._get_or_create(key, url=url, cwd=cwd)
+        session.watch_deliveries()
         try:
-            await session.ensure_session()
+            await session.ensure_existing(session_id)
         except Exception:
-            await self._drop(key, session, reason="建立会话失败")
+            await self._drop(key, session, reason="唤醒已有会话失败")
             raise
         return session
 

@@ -82,6 +82,13 @@ KEY_AGENT_STATUS = EXT_PREFIX + "agent_status"
 #: 等价于 ``mkdir -p``（递归、幂等），``path`` 是**相对会话 cwd** 的路径。
 METHOD_FS_MKDIR = EXT_PREFIX + "fs/mkdir"
 
+#: alkaid0 扩展方法：查询 / 删除当前已绑定会话的定时任务（ext §3.11）。
+METHOD_CRON_LIST = EXT_PREFIX + "session/cron/list"
+METHOD_CRON_DELETE = EXT_PREFIX + "session/cron/delete"
+
+#: alkaid0 扩展能力标记：服务端支持 ``session/cron/*`` 才为真。
+CAPABILITY_CRON = EXT_PREFIX + "cron"
+
 # ── tool_call_update 的 status ────────────────────────────────────────
 TOOL_STATUS_PENDING = "pending"
 #: alkaid0 的流式预览（0.1s 限流推完整快照），回显时要跳过以免刷屏。

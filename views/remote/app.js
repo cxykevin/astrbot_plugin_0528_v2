@@ -83,6 +83,7 @@ const state = {
   jsonError: "",
   warning: "",
   dirtyCount: 0,
+  hook: null,
 };
 
 const els = {};
@@ -112,6 +113,7 @@ async function boot() {
   els.applyJson = document.getElementById("apply-json");
   els.formatJson = document.getElementById("format-json");
   els.syncJson = document.getElementById("sync-json");
+  els.wakeupHook = document.getElementById("wakeup-hook");
   els.modal = document.getElementById("modal");
   els.modalText = document.getElementById("modal-text");
   els.modalOk = document.getElementById("modal-ok");
@@ -133,6 +135,7 @@ async function boot() {
   });
 
   await loadConfig();
+  await loadHookStatus();
 }
 
 async function resolveBridge() {
@@ -227,6 +230,69 @@ async function loadConfig() {
   } finally {
     setBusy(false);
     refreshDirtyMarks();
+  }
+}
+
+// ── alkaid0 cron 唤醒钩子：一键安装 / 移除 ────────────────────────────
+async function loadHookStatus() {
+  if (!els.wakeupHook) {
+    return;
+  }
+  try {
+    const data = await bridge.apiGet("panel/hook");
+    state.hook = data && typeof data === "object" ? data : null;
+  } catch (error) {
+    state.hook = null;
+  }
+  renderHookButton();
+}
+
+function renderHookButton() {
+  if (!els.wakeupHook) {
+    return;
+  }
+  const hook = state.hook;
+  if (!hook) {
+    els.wakeupHook.hidden = true;
+    return;
+  }
+  els.wakeupHook.hidden = false;
+  const installed = hook.installed === true;
+  els.wakeupHook.textContent = installed
+    ? T("views.remote.hook.remove", "移除唤醒钩子")
+    : T("views.remote.hook.install", "一键安装唤醒钩子");
+  const endpoint = String(hook.endpoint || "");
+  const note = String(hook.note || "");
+  els.wakeupHook.title = [endpoint, note].filter(Boolean).join(" · ");
+  els.wakeupHook.disabled = state.busy;
+}
+
+async function runHookAction() {
+  if (state.busy || !state.hook) {
+    return;
+  }
+  const action = state.hook.installed === true ? "remove" : "install";
+  setBusy(true);
+  setStatus(T("views.remote.hook.busy", "正在同步唤醒钩子…"));
+  try {
+    const result = await bridge.apiPost("panel/hook", { action });
+    const ok = !result || result.ok !== false;
+    const fallback =
+      action === "install"
+        ? T("views.remote.hook.done_install", "已安装唤醒钩子。")
+        : T("views.remote.hook.done_remove", "已移除唤醒钩子。");
+    setStatus(
+      (result && result.note) ||
+        (ok ? fallback : T("views.remote.hook.failed", "同步失败，详情见日志。")),
+      ok ? "ok" : "error",
+    );
+  } catch (error) {
+    setStatus(formatError(error), "error");
+  } finally {
+    setBusy(false);
+    await loadHookStatus();
+    // Hooks / TerminalEnvs 刚被改过，重新拉一次 alkaid0 配置
+    await loadConfig();
   }
 }
 
@@ -2222,6 +2288,11 @@ function bindEvents() {
   els.syncJson.addEventListener("click", () => {
     syncJsonFromDraft();
   });
+  if (els.wakeupHook) {
+    els.wakeupHook.addEventListener("click", () => {
+      void runHookAction();
+    });
+  }
   els.jsonEditor.addEventListener("input", () => {
     state.jsonDirty = true;
     clearJsonError();

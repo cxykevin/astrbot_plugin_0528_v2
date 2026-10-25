@@ -52,5 +52,65 @@
         "type": "bool",
         "default": false,
         "hint": "开启后，alkaid0 推送的 agent_thought(_chunk) 会以 reasoning 消息链的形式发出去。以执行器面板为准。"
+    },
+    "auto_approve_enable": {
+        "description": "启用工具审批直通（Auto-Approve）",
+        "type": "bool",
+        "default": false,
+        "hint": "工具审批的总开关。关闭时维持旧行为：session/request_permission 一律挂起，等群友发 /aapprove；开启后才按「配置白名单 / 提示词 / 外部钩子」三层授权自动放行。以执行器面板为准。"
+    },
+    "auto_approve_tools": {
+        "description": "自动批准的工具白名单",
+        "type": "string",
+        "default": "",
+        "hint": "逗号 / 空格 / 换行分隔，大小写不敏感，支持 * 与 ? 通配；单独写 * 表示全部工具。留空表示配置层不放行任何工具。以执行器面板为准。"
+    },
+    "auto_approve_prompt": {
+        "description": "允许提示词临时授权",
+        "type": "bool",
+        "default": true,
+        "hint": "开启后，群消息里写 [auto_approve: read, edit] 可只对本轮放行；只写 [auto_approve] 表示本轮全部放行。标记会在发给 alkaid0 前删掉。仍受总开关限制。以执行器面板为准。"
+    },
+    "auto_approve_hook": {
+        "description": "允许外部钩子临时授权",
+        "type": "bool",
+        "default": true,
+        "hint": "开启后，/wakeup 等外部入口可在请求里带 auto_approve（true 或工具名列表），只对这次外部回合放行；仍受总开关限制。以执行器面板为准。"
+    },
+    "wakeup_enable": {
+        "description": "启用 HTTP 唤醒钩子（cronjob）",
+        "type": "bool",
+        "default": false,
+        "hint": "唤醒接口直接复用 AstrBot 自己的 Web 端口（/api/v1/plugins/extensions/astrbot_plugin_0528_v2/wakeup），不再另开端口。开启后，alkaid0 的 cron 唤醒钩子传入会话 ID，就把所有绑定这个会话的群续接上（session/resume），等它们真的收到这一轮的消息再返回。一键安装会自动打开这个开关。"
+    },
+    "wakeup_api_key": {
+        "description": "可选的第二道口令",
+        "type": "string",
+        "default": "",
+        "hint": "留空表示只靠 AstrBot 的 API Key 鉴权（推荐，一键安装时自动申请）。填了的话，调用还要带 X-0528V2-Key 请求头（或 ?plugin_key=），值同样明文写进钩子命令。改完记得重新点一次「一键安装」。"
+    },
+    "wakeup_public_url": {
+        "description": "唤醒钩子的对外地址（可选）",
+        "type": "string",
+        "default": "",
+        "hint": "alkaid0 不在同一台机器或在容器里时填它，例如 http://172.17.0.1:6185。留空则用 AstrBot 自己的监听地址 + 端口（监听 0.0.0.0 时对外用 127.0.0.1）。"
+    },
+    "wakeup_wait_sec": {
+        "description": "等待消息送达的秒数",
+        "type": "int",
+        "default": 30,
+        "hint": "唤醒后最多等多久，直到连接真的收到这一轮的内容（user_message / agent_message 等）再返回 HTTP 响应。超时会返回 504，alkaid0 的钩子会记录失败。"
+    },
+    "wakeup_relay_reply": {
+        "description": "把 cron 回合的回复转发到群",
+        "type": "bool",
+        "default": true,
+        "hint": "开启后，cron 唤醒的这一轮结束时会把正文（以及 echo_events 开启时的过程消息）主动发到绑定该会话的群聊；工具审批也会在群里提示 /aapprove。关闭后只唤醒连接、接收通知，不再往外发消息。"
+    },
+    "wakeup_auto_approve": {
+        "description": "cron 钩子的自动批准工具",
+        "type": "string",
+        "default": "",
+        "hint": "留空表示不直通。填 * 表示 cron 回合全部工具直通；也可以填工具名清单（逗号 / 空格分隔），写进 alkaid0 的钩子命令时作为 auto_approve 查询参数。仍受「工具审批直通」总开关与「允许外部钩子临时授权」限制。改完要重新点一次「一键安装」。"
     }
 }

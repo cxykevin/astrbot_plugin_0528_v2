@@ -40,6 +40,46 @@
     "show_thought": {
       "description": "Send reasoning/thoughts to the chat",
       "hint": "When enabled, agent_thought(_chunk) updates are sent as reasoning message chains. The runner panel takes precedence."
+    },
+    "auto_approve_enable": {
+      "description": "Enable tool approval passthrough (Auto-Approve)",
+      "hint": "Master switch for tool approvals. When disabled, session/request_permission is always deferred until someone sends /aapprove. When enabled, approvals may pass through the configured whitelist, prompt grants, or external hook grants. The runner panel value takes precedence."
+    },
+    "auto_approve_tools": {
+      "description": "Auto-approved tool whitelist",
+      "hint": "Separated by commas / spaces / newlines, case-insensitive, supports * and ? wildcards; a single * means every tool. Empty means no tools are approved by the config layer. The runner panel value takes precedence."
+    },
+    "auto_approve_prompt": {
+      "description": "Allow per-turn prompt grants",
+      "hint": "When enabled, a chat message containing [auto_approve: read, edit] approves those tools for this turn only; [auto_approve] alone approves every tool for this turn. The marker is removed before the prompt is sent. The master switch still applies."
+    },
+    "auto_approve_hook": {
+      "description": "Allow external hook grants",
+      "hint": "When enabled, /wakeup and other external entry points may pass auto_approve (true or a tool list) to approve only that external turn. The master switch still applies."
+    },
+    "wakeup_enable": {
+      "description": "Enable the HTTP wake-up hook (cronjob)",
+      "hint": "The wake-up endpoint reuses AstrBot's own Web port (/api/v1/plugins/extensions/astrbot_plugin_0528_v2/wakeup); no extra port is opened. It accepts a session ID, resumes every conversation bound to that session and only answers once the connections have actually received this turn's updates. A one-click install turns this switch on."
+    },
+    "wakeup_api_key": {
+      "description": "Optional second secret",
+      "hint": "Leave empty to rely on AstrBot's own API key (recommended; the one-click install creates one). If set, callers must also send X-0528V2-Key (or ?plugin_key=); the value is written into the hook command in plain text as well. Click one-click install again after changing it."
+    },
+    "wakeup_public_url": {
+      "description": "Public URL of the wake-up hook (optional)",
+      "hint": "Set this when alkaid0 runs on another host or in a container, e.g. http://172.17.0.1:6185. Leave empty to derive it from AstrBot's own bind address and port (0.0.0.0 becomes 127.0.0.1)."
+    },
+    "wakeup_wait_sec": {
+      "description": "Seconds to wait for message delivery",
+      "hint": "How long the HTTP call may wait until the connections really receive this turn's content (user_message / agent_message, ...). On timeout it returns 504 and alkaid0 logs the hook as failed."
+    },
+    "wakeup_relay_reply": {
+      "description": "Relay the cron turn's reply to the chat",
+      "hint": "When enabled, the reply of the cron-triggered turn (plus progress lines when echo_events is on) is sent to every conversation bound to the session; tool approvals are announced there as well. Disable to only wake and receive notifications without sending anything."
+    },
+    "wakeup_auto_approve": {
+      "description": "Auto-approved tools for the cron hook",
+      "hint": "Empty disables passthrough. Use * to approve every tool for cron turns, or a comma/space separated tool list. It is appended to the installed alkaid0 hook command as the auto_approve query parameter. The Auto-Approve master switch and external-hook permission still apply. Click one-click install again after changing it."
     }
   },
   "views": {
@@ -63,10 +103,33 @@
           "title": "Chat echo",
           "description": "Control whether progress events and reasoning are sent to the chat."
         },
+        "auto_approve": {
+          "title": "Tool approval passthrough",
+          "description": "Auto-approve tool requests from the configured whitelist, prompt grants, or external hooks; everything else still waits for /aapprove."
+        },
         "other": {
           "title": "Other",
           "description": "Configuration items that are not grouped yet."
+        },
+        "wakeup": {
+          "title": "Wake-up hook (cronjob)",
+          "description": "Expose a wake-up endpoint on AstrBot's own Web port for alkaid0's cron wake-up hook. Writing it into alkaid0 requires clicking one-click install."
         }
+      },
+      "hook": {
+        "title": "alkaid0 cron wake-up hook",
+        "description": "Only the buttons change alkaid0's configuration (saving the settings above does not sync automatically). One-click install also creates an AstrBot API key, writes it into the hook command in plain text and turns the wake-up switch on; click it again after changing the URL / secret.",
+        "install": "One-click install",
+        "remove": "Remove",
+        "endpoint": "Endpoint",
+        "busy": "Installing…",
+        "never": "Not installed yet",
+        "installed": "Installed",
+        "removed": "Not installed",
+        "not_ready": "The wake-up hook is disabled. Turn the switch above on, save, then click one-click install.",
+        "done_install": "Installed: the API key was created and the hook was written into alkaid0.",
+        "done_remove": "Removed: the hook and the API key were cleaned up.",
+        "failed": "Sync failed; check the status below or the AstrBot logs."
       },
       "ui": {
         "title": "Configuration panel",
@@ -191,6 +254,15 @@
         "discard_confirm": "There are unsaved changes. Reloading will discard them. Continue?",
         "reload_remote_confirm": "Ask alkaid0 to reload its configuration from disk? This overwrites the current in-memory values.",
         "reloaded": "Reloaded alkaid0 configuration from disk."
+      },
+      "hook": {
+        "title": "cron wake-up hook",
+        "install": "One-click install",
+        "remove": "Remove wake-up hook",
+        "busy": "Installing the wake-up hook…",
+        "done_install": "Wake-up hook installed: the API key was created and written into the hook command.",
+        "done_remove": "Wake-up hook removed and the API key cleaned up.",
+        "failed": "Failed to sync the wake-up hook; check the status or the AstrBot logs."
       },
       "errors": {
         "bad_payload": "Invalid request payload.",

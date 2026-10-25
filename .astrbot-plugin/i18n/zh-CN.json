@@ -40,6 +40,46 @@
     "show_thought": {
       "description": "把思考过程一起发出去",
       "hint": "开启后，alkaid0 推送的 agent_thought(_chunk) 会以 reasoning 消息链的形式发出去。以执行器面板为准。"
+    },
+    "auto_approve_enable": {
+      "description": "启用工具审批直通（Auto-Approve）",
+      "hint": "工具审批的总开关。关闭时维持旧行为：session/request_permission 一律挂起，等群友发 /aapprove；开启后才按「配置白名单 / 提示词 / 外部钩子」三层授权自动放行。以执行器面板为准。"
+    },
+    "auto_approve_tools": {
+      "description": "自动批准的工具白名单",
+      "hint": "逗号 / 空格 / 换行分隔，大小写不敏感，支持 * 与 ? 通配；单独写 * 表示全部工具。留空表示配置层不放行任何工具。以执行器面板为准。"
+    },
+    "auto_approve_prompt": {
+      "description": "允许提示词临时授权",
+      "hint": "开启后，群消息里写 [auto_approve: read, edit] 可只对本轮放行；只写 [auto_approve] 表示本轮全部放行。标记会在发给 alkaid0 前删掉。仍受总开关限制。以执行器面板为准。"
+    },
+    "auto_approve_hook": {
+      "description": "允许外部钩子临时授权",
+      "hint": "开启后，/wakeup 等外部入口可在请求里带 auto_approve（true 或工具名列表），只对这次外部回合放行；仍受总开关限制。以执行器面板为准。"
+    },
+    "wakeup_enable": {
+      "description": "启用 HTTP 唤醒钩子（cronjob）",
+      "hint": "唤醒接口直接复用 AstrBot 自己的 Web 端口（/api/v1/plugins/extensions/astrbot_plugin_0528_v2/wakeup），不再另开端口。开启后，alkaid0 的 cron 唤醒钩子传入会话 ID，就把所有绑定这个会话的群续接上（session/resume），等它们真的收到这一轮的消息再返回。一键安装会自动打开这个开关。"
+    },
+    "wakeup_api_key": {
+      "description": "可选的第二道口令",
+      "hint": "留空表示只靠 AstrBot 的 API Key 鉴权（推荐，一键安装时自动申请）。填了的话，调用还要带 X-0528V2-Key 请求头（或 ?plugin_key=），值同样明文写进钩子命令。改完记得重新点一次「一键安装」。"
+    },
+    "wakeup_public_url": {
+      "description": "唤醒钩子的对外地址（可选）",
+      "hint": "alkaid0 不在同一台机器或在容器里时填它，例如 http://172.17.0.1:6185。留空则用 AstrBot 自己的监听地址 + 端口（监听 0.0.0.0 时对外用 127.0.0.1）。"
+    },
+    "wakeup_wait_sec": {
+      "description": "等待消息送达的秒数",
+      "hint": "唤醒后最多等多久，直到连接真的收到这一轮的内容（user_message / agent_message 等）再返回 HTTP 响应。超时会返回 504，alkaid0 的钩子会记录失败。"
+    },
+    "wakeup_relay_reply": {
+      "description": "把 cron 回合的回复转发到群",
+      "hint": "开启后，cron 唤醒的这一轮结束时会把正文（以及 echo_events 开启时的过程消息）主动发到绑定该会话的群聊；工具审批也会在群里提示 /aapprove。关闭后只唤醒连接、接收通知，不再往外发消息。"
+    },
+    "wakeup_auto_approve": {
+      "description": "cron 钩子的自动批准工具",
+      "hint": "留空表示不直通。填 * 表示 cron 回合全部工具直通；也可以填工具名清单（逗号 / 空格分隔），写进 alkaid0 的钩子命令时作为 auto_approve 查询参数。仍受「工具审批直通」总开关与「允许外部钩子临时授权」限制。改完要重新点一次「一键安装」。"
     }
   },
   "views": {
@@ -63,10 +103,33 @@
           "title": "聊天回显",
           "description": "控制工具调用等过程消息、以及思考过程是否发到群里。"
         },
+        "auto_approve": {
+          "title": "工具审批直通",
+          "description": "按配置白名单 / 提示词 / 外部钩子自动放行工具审批；没命中的仍挂起等 /aapprove。"
+        },
         "other": {
           "title": "其它",
           "description": "schema 里尚未归类的配置项。"
+        },
+        "wakeup": {
+          "title": "唤醒钩子（cronjob）",
+          "description": "复用 AstrBot 自己的 Web 端口暴露一个唤醒接口，供 alkaid0 的 cron 唤醒钩子调用。写进 alkaid0 配置需要手动点「一键安装」。"
         }
+      },
+      "hook": {
+        "title": "alkaid0 的 cron 唤醒钩子",
+        "description": "只有按钮会改动 alkaid0 的配置（保存上面的设置不会自动同步）。一键安装会顺便申请一个 AstrBot API Key、明文写进钩子命令，并打开唤醒开关；改了地址 / 口令后再点一次。",
+        "install": "一键安装",
+        "remove": "移除钩子",
+        "endpoint": "唤醒端点",
+        "busy": "正在安装…",
+        "never": "还没安装过",
+        "installed": "已安装",
+        "removed": "未安装",
+        "not_ready": "唤醒钩子未启用：先打开上面的开关并保存，再点一键安装。",
+        "done_install": "已安装：API Key 已申请，钩子已写入 alkaid0。",
+        "done_remove": "已移除：钩子与 API Key 都已清理。",
+        "failed": "同步失败，详情见下方状态或 AstrBot 日志。"
       },
       "ui": {
         "title": "配置面板",
@@ -191,6 +254,15 @@
         "discard_confirm": "当前有未保存的改动，重新读取会丢弃它们。继续吗？",
         "reload_remote_confirm": "让 alkaid0 从磁盘重新加载配置？这会覆盖内存里的当前值。",
         "reloaded": "已从磁盘重载 alkaid0 配置。"
+      },
+      "hook": {
+        "title": "cron 唤醒钩子",
+        "install": "一键安装唤醒钩子",
+        "remove": "移除唤醒钩子",
+        "busy": "正在安装唤醒钩子…",
+        "done_install": "已安装唤醒钩子：API Key 已申请并明文写进钩子命令。",
+        "done_remove": "已移除唤醒钩子，API Key 已清理。",
+        "failed": "同步唤醒钩子失败，详情见状态或 AstrBot 日志。"
       },
       "errors": {
         "bad_payload": "请求格式不正确。",

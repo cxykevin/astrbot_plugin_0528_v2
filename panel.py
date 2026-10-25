@@ -65,8 +65,16 @@ RELOAD_KEYS = frozenset(
 MAX_STRING_LENGTH = 4096
 
 #: 数值字段的范围；不在这里的数值字段不限制。
-_MINIMUMS = {"idle_timeout_sec": 0, "turn_timeout_sec": 1}
-_MAXIMUMS = {"idle_timeout_sec": 31_536_000, "turn_timeout_sec": 604_800}
+_MINIMUMS = {
+    "idle_timeout_sec": 0,
+    "turn_timeout_sec": 1,
+    "wakeup_wait_sec": 1,
+}
+_MAXIMUMS = {
+    "idle_timeout_sec": 31_536_000,
+    "turn_timeout_sec": 604_800,
+    "wakeup_wait_sec": 600,
+}
 
 #: 分组顺序与每组包含的字段。schema 里不在这些组里的字段归入「其它」。
 GROUP_SPECS: tuple[tuple[str, str, str, tuple[str, ...]], ...] = (
@@ -97,6 +105,31 @@ GROUP_SPECS: tuple[tuple[str, str, str, tuple[str, ...]], ...] = (
         "聊天回显",
         "控制工具调用等过程消息、以及思考过程是否发到群里。",
         ("echo_events", "show_thought"),
+    ),
+    (
+        "auto_approve",
+        "工具审批直通",
+        "按配置白名单 / 提示词 / 外部钩子自动放行工具审批；没命中的仍挂起等 /aapprove。",
+        (
+            "auto_approve_enable",
+            "auto_approve_tools",
+            "auto_approve_prompt",
+            "auto_approve_hook",
+        ),
+    ),
+    (
+        "wakeup",
+        "唤醒钩子（cronjob）",
+        "复用 AstrBot 自己的 Web 端口，供 alkaid0 的 cron 唤醒钩子调用；"
+        "在 alkaid0 远程配置页点「一键安装唤醒钩子」即可写入。",
+        (
+            "wakeup_enable",
+            "wakeup_api_key",
+            "wakeup_public_url",
+            "wakeup_wait_sec",
+            "wakeup_relay_reply",
+            "wakeup_auto_approve",
+        ),
     ),
 )
 
@@ -139,7 +172,7 @@ def _default_for(kind: str) -> Any:
 def _mask_mode_for(key: str) -> str | None:
     """这个字段该怎么脱敏：``url``（只打码查询参数 / userinfo）或 ``secret``。"""
     lowered = key.lower()
-    if key == "acp_url" or lowered.endswith("_repo"):
+    if key in ("acp_url", "wakeup_public_url") or lowered.endswith("_repo"):
         return "url"
     if any(
         token in lowered
@@ -477,6 +510,13 @@ class PanelService:
             用来在字段上标注「面板值优先」。
         after_save: 保存成功后的回调，接收 ``{字段: 新值}``，返回「是否需要
             重载插件」；可以是同步或异步函数。
+        hook_action: 「写入 / 移除 alkaid0 cron 钩子」按钮的回调，接收
+            ``"install"`` / ``"remove"``，返回要交给前端的 ``dict``；缺席时不注册
+            该接口（面板上也不显示按钮）。
+        hook_status_provider: 返回钩子现状（``installed`` / ``note`` / ``endpoint``
+            等），随配置树一起下发。
+        hook_status_async_provider: 同上的异步版本（会回读 alkaid0），供
+            ``GET panel/hook`` 使用；缺席时回落到同步版本。
     """
 
     def __init__(
@@ -487,12 +527,18 @@ class PanelService:
         version: str,
         panel_config_provider: Callable[[], Any] | None = None,
         after_save: Callable[[dict[str, Any]], Any] | None = None,
+        hook_action: Callable[[str], Any] | None = None,
+        hook_status_provider: Callable[[], Any] | None = None,
+        hook_status_async_provider: Callable[[], Any] | None = None,
     ) -> None:
         self.config = config
         self.plugin_name = plugin_name
         self.version = version
         self.panel_config_provider = panel_config_provider
         self.after_save = after_save
+        self.hook_action = hook_action
+        self.hook_status_provider = hook_status_provider
+        self.hook_status_async_provider = hook_status_async_provider
         self._lock = asyncio.Lock()
 
     # ── 读取 ─────────────────────────────────────────────
@@ -590,7 +636,20 @@ class PanelService:
             "version": self.version,
             "groups": groups,
             "reload_keys": sorted(RELOAD_KEYS & {spec.key for spec in FIELD_SPECS}),
+            "hook": self._hook_info(),
         }
+
+    def _hook_info(self) -> dict[str, Any]:
+        """钩子现状（供面板显示按钮旁的状态）；没有回调时返回空表。"""
+        provider = self.hook_status_provider
+        if provider is None:
+            return {}
+        try:
+            data = provider()
+        except Exception as exc:  # noqa: BLE001 - 状态读不到不该让配置树打不开
+            logger.warning("0528v2: 读取 cron 钩子状态失败：%s", exc)
+            return {}
+        return dict(data) if isinstance(data, Mapping) else {}
 
     # ── 保存 ─────────────────────────────────────────────
     async def _persist(self) -> None:
@@ -690,6 +749,54 @@ class PanelService:
             },
         )
 
+    # ── 手动动作（写入 / 移除 alkaid0 cron 钩子）───────────
+    async def apply_hook_action(self, action: str) -> ApplyResult:
+        """执行一次钩子动作（``install`` / ``remove``）。
+
+        「写进 alkaid0 配置」是外部副作用，只由面板上的按钮触发 —— 保存插件配置、
+        插件启用都不再自动改 alkaid0。
+        """
+        if self.hook_action is None:
+            return ApplyResult(False, "hook_unavailable")
+        if action not in ("install", "remove"):
+            return ApplyResult(False, "bad_payload")
+        try:
+            result = self.hook_action(action)
+            if inspect.isawaitable(result):
+                result = await result
+        except Exception as exc:  # noqa: BLE001 - alkaid0 没起来 / 写不进去
+            logger.warning("0528v2: 手动同步 alkaid0 cron 钩子失败：%s", exc)
+            return ApplyResult(False, "hook_failed")
+        data = dict(result) if isinstance(result, Mapping) else {}
+        return ApplyResult(True, data=data)
+
+    async def run_hook_action(self):
+        """``POST panel/hook``：面板按钮调用的接口。"""
+        payload = await request.json(default={})
+        if not isinstance(payload, dict):
+            return error_response("bad_payload")
+        async with self._lock:
+            result = await self.apply_hook_action(str(payload.get("action") or ""))
+        if not result.ok:
+            return error_response(result.code)
+        return json_response({"status": "ok", "data": result.data})
+
+    async def run_hook_status(self):
+        """``GET panel/hook``：回读 alkaid0，返回真实的钩子状态。"""
+        provider = self.hook_status_async_provider
+        if provider is None:
+            data = self._hook_info()
+        else:
+            try:
+                result = provider()
+                if inspect.isawaitable(result):
+                    result = await result
+                data = dict(result) if isinstance(result, Mapping) else {}
+            except Exception as exc:  # noqa: BLE001 - 状态读不到不该让页面打不开
+                logger.warning("0528v2: 回读 cron 钩子状态失败：%s", exc)
+                data = self._hook_info()
+        return json_response({"status": "ok", "data": data})
+
     # ── Web API ──────────────────────────────────────────
     async def get_config(self):
         """``GET panel/config``：返回配置树。"""
@@ -718,6 +825,20 @@ class PanelService:
         base = f"/{self.plugin_name}/panel/config"
         context.register_web_api(base, self.get_config, ["GET"], "插件配置树")
         context.register_web_api(base, self.save_config, ["POST"], "保存插件配置")
+        if self.hook_action is not None:
+            hook_path = f"/{self.plugin_name}/panel/hook"
+            context.register_web_api(
+                hook_path,
+                self.run_hook_status,
+                ["GET"],
+                "读取 alkaid0 cron 钩子状态",
+            )
+            context.register_web_api(
+                hook_path,
+                self.run_hook_action,
+                ["POST"],
+                "写入 / 移除 alkaid0 cron 钩子",
+            )
         logger.info("0528v2: 配置面板接口已注册 %s（GET/POST）", base)
 
     def unregister(self, context: Any) -> None:

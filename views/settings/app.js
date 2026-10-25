@@ -14,6 +14,7 @@ const state = {
   expandedReady: false,
   busy: false,
   reloadWarning: false,
+  hookButtons: [],
 };
 
 const els = {};
@@ -212,6 +213,7 @@ function renderTree() {
   }
 
   state.controls.clear();
+  state.hookButtons = [];
   els.tree.replaceChildren();
   els.tree.setAttribute("aria-busy", "false");
 
@@ -270,6 +272,12 @@ function renderGroup(group) {
   body.className = "group-body";
   for (const field of group.fields) {
     body.append(renderField(field));
+  }
+  if (group.key === "wakeup") {
+    const actions = renderHookActions();
+    if (actions) {
+      body.append(actions);
+    }
   }
   if (group.fields.length === 0) {
     body.append(emptyNote(T("views.settings.ui.empty_group", "这个分组还没有配置项。")));
@@ -407,6 +415,145 @@ function renderField(field) {
     controlState.row = row;
   }
   return row;
+}
+
+// ── alkaid0 cron 钩子：手动按钮（保存配置不会自动同步）──────────────
+function hookState() {
+  const hook = state.config && state.config.hook;
+  return hook && typeof hook === "object" ? hook : null;
+}
+
+function renderHookActions() {
+  const hook = hookState();
+  if (!hook) {
+    return null;
+  }
+
+  const row = document.createElement("div");
+  row.className = "field hook-actions";
+
+  const head = document.createElement("div");
+  head.className = "field-head";
+  const title = document.createElement("span");
+  title.className = "field-title";
+  title.textContent = T(
+    "views.settings.hook.title",
+    "alkaid0 的 cron 唤醒钩子",
+  );
+  head.append(title);
+  row.append(head);
+
+  const hint = document.createElement("div");
+  hint.className = "field-hint";
+  hint.textContent = T(
+    "views.settings.hook.description",
+    "按钮才会改动 alkaid0 的配置（保存上面的设置不会自动同步）。",
+  );
+  row.append(hint);
+
+  const control = document.createElement("div");
+  control.className = "field-control";
+
+  const install = document.createElement("button");
+  install.type = "button";
+  install.className = "btn primary small";
+  install.textContent = T("views.settings.hook.install", "写入 / 更新钩子");
+  install.disabled = state.busy || hook.usable === false;
+  install.addEventListener("click", () => {
+    void runHookAction("install");
+  });
+
+  const remove = document.createElement("button");
+  remove.type = "button";
+  remove.className = "btn ghost small";
+  remove.textContent = T("views.settings.hook.remove", "移除钩子");
+  remove.disabled = state.busy || hook.installed === false;
+  remove.addEventListener("click", () => {
+    void runHookAction("remove");
+  });
+
+  control.append(install, remove);
+  row.append(control);
+  state.hookButtons = [install, remove];
+
+  const status = document.createElement("div");
+  status.className = "field-meta";
+  const note =
+    hook.note ||
+    (hook.installed === true
+      ? T("views.settings.hook.installed", "已写入")
+      : hook.installed === false
+        ? T("views.settings.hook.removed", "未写入")
+        : T("views.settings.hook.never", "还没手动同步过"));
+  const parts = [];
+  if (hook.endpoint) {
+    parts.push(
+      `${T("views.settings.hook.endpoint", "唤醒端点")}: ${hook.endpoint}`,
+    );
+  }
+  parts.push(note);
+  status.textContent = parts.join(" · ");
+  row.append(status);
+
+  if (hook.usable === false) {
+    const warning = document.createElement("div");
+    warning.className = "field-hint";
+    warning.textContent = T(
+      "views.settings.hook.not_ready",
+      "唤醒钩子未启用或没配 apikey：先把上面的开关和 apikey 填好并保存，再点写入。",
+    );
+    row.append(warning);
+  }
+
+  return row;
+}
+
+async function runHookAction(action) {
+  if (state.busy) {
+    return;
+  }
+  setBusy(true);
+  setStatus(T("views.settings.hook.busy", "正在同步…"));
+  try {
+    const result = await bridge.apiPost("panel/hook", { action });
+    if (!result || typeof result !== "object") {
+      throw new Error("bad_response");
+    }
+    const previous = hookState() || {};
+    state.config.hook = {
+      ...previous,
+      installed:
+        typeof result.installed === "boolean"
+          ? result.installed
+          : previous.installed,
+      note: String(result.note || ""),
+      endpoint: String(result.endpoint || previous.endpoint || ""),
+    };
+    const ok = result.ok !== false;
+    const done =
+      action === "install"
+        ? T(
+            "views.settings.hook.done_install",
+            "已写入 alkaid0 的 OnCronjobWakeup。",
+          )
+        : T(
+            "views.settings.hook.done_remove",
+            "已从 alkaid0 移除本插件的钩子。",
+          );
+    setStatus(
+      ok
+        ? result.note || done
+        : result.note || T("views.settings.hook.failed", "同步失败，详情见日志。"),
+      ok ? "ok" : "error",
+    );
+  } catch (error) {
+    setStatus(formatError(error), "error");
+  } finally {
+    setBusy(false);
+    if (state.config) {
+      renderTree();
+    }
+  }
 }
 
 function buildControl(field, initial, row) {
@@ -572,7 +719,12 @@ function setFieldValue(field, value) {
 // ── 状态 / 提示 ───────────────────────────────────────────────────────
 function setBusy(busy) {
   state.busy = busy;
-  for (const button of [els.reload, els.expandAll, els.collapseAll]) {
+  for (const button of [
+    els.reload,
+    els.expandAll,
+    els.collapseAll,
+    ...state.hookButtons,
+  ]) {
     if (button) {
       button.disabled = busy;
     }

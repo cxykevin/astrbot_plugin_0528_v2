@@ -35,8 +35,8 @@ from astrbot.core.message.message_event_result import MessageChain
 from astrbot.core.provider.entities import LLMResponse, ProviderRequest
 
 from .acp import ACPConnectionError, ACPError, GroupSession, SessionPool
+from .acp import approval as approval_mod
 from .acp import protocol as acp
-from .acp.client import DEFERRED
 from .turn_queue import (
     ACTION_ABSORBED,
     ACTION_MERGED,
@@ -80,6 +80,10 @@ RUNNER_CONFIG_DEFAULT: dict[str, T.Any] = {
     "turn_timeout_sec": DEFAULT_TURN_TIMEOUT_SEC,
     "echo_events": True,
     "show_thought": False,
+    "auto_approve_enable": False,
+    "auto_approve_tools": "",
+    "auto_approve_prompt": True,
+    "auto_approve_hook": True,
 }
 
 #: 执行器配置字段在面板上的说明。
@@ -119,6 +123,38 @@ RUNNER_CONFIG_METADATA: dict[str, T.Any] = {
         "description": "把思考过程一起发出去",
         "type": "bool",
         "hint": "开启后 agent_thought 会被放进 reasoning 消息链。",
+    },
+    "auto_approve_enable": {
+        "description": "启用工具审批直通（Auto-Approve）",
+        "type": "bool",
+        "hint": (
+            "总开关。关闭时所有审批仍按旧行为挂起，等群友发 /aapprove；"
+            "开启后才按「配置白名单 / 提示词 / 外部钩子」三层授权自动放行。"
+        ),
+    },
+    "auto_approve_tools": {
+        "description": "自动批准的工具白名单",
+        "type": "string",
+        "hint": (
+            "逗号 / 空格 / 换行分隔，大小写不敏感，支持 * 与 ? 通配；"
+            "单独写 * 表示全部工具。留空表示配置层不放行任何工具。"
+        ),
+    },
+    "auto_approve_prompt": {
+        "description": "允许提示词临时授权",
+        "type": "bool",
+        "hint": (
+            "开启后，群消息里写 [auto_approve: read, edit] 可只对本轮放行；"
+            "不写工具名（[auto_approve]）表示本轮全部放行。标记会从提示词里删掉。"
+        ),
+    },
+    "auto_approve_hook": {
+        "description": "允许外部钩子临时授权",
+        "type": "bool",
+        "hint": (
+            "开启后，/wakeup 等外部入口可在请求里带 auto_approve（true 或工具名列表），"
+            "只对这次外部回合放行；仍受总开关限制。"
+        ),
     },
 }
 
@@ -191,6 +227,10 @@ class RunnerSettings:
         turn_timeout_sec: 单轮最大等待秒数。
         echo_events: 是否把过程消息（工具调用 / 子 Agent / 后台任务）回显进回复。
         show_thought: 是否把思考过程也作为 reasoning 消息发出。
+        auto_approve_enable: 工具审批直通总开关。
+        auto_approve_tools: 自动批准的工具白名单（逗号 / 空格分隔，支持通配）。
+        auto_approve_prompt: 是否允许提示词里的 ``[auto_approve: ...]`` 临时授权。
+        auto_approve_hook: 是否允许外部钩子按请求参数临时授权。
     """
 
     url: str = DEFAULT_ACP_URL
@@ -199,6 +239,10 @@ class RunnerSettings:
     turn_timeout_sec: float = float(DEFAULT_TURN_TIMEOUT_SEC)
     echo_events: bool = True
     show_thought: bool = False
+    auto_approve_enable: bool = False
+    auto_approve_tools: str = ""
+    auto_approve_prompt: bool = True
+    auto_approve_hook: bool = True
 
     @classmethod
     def from_config(
@@ -229,6 +273,18 @@ class RunnerSettings:
             ),
             show_thought=_as_bool(
                 _pick(provider_config, plugin_config, "show_thought"), False
+            ),
+            auto_approve_enable=_as_bool(
+                _pick(provider_config, plugin_config, "auto_approve_enable"), False
+            ),
+            auto_approve_tools=str(
+                _pick(provider_config, plugin_config, "auto_approve_tools") or ""
+            ).strip(),
+            auto_approve_prompt=_as_bool(
+                _pick(provider_config, plugin_config, "auto_approve_prompt"), True
+            ),
+            auto_approve_hook=_as_bool(
+                _pick(provider_config, plugin_config, "auto_approve_hook"), True
             ),
         )
 
@@ -503,7 +559,8 @@ def permission_hint(session: T.Any) -> str:
     pending = _pending_permission(session)
     title = ""
     if pending is not None:
-        title = str((pending[1] or {}).get("title") or "").strip()
+        params = pending[1] or {}
+        title = approval_mod.tool_name_of(params) or str(params.get("title") or "").strip()
     return (
         f"⏳ 工具审批：{title}（回复 /aapprove 允许）"
         if title
@@ -511,37 +568,31 @@ def permission_hint(session: T.Any) -> str:
     )
 
 
-def build_permission_handler(session: T.Any, label: str = "") -> T.Callable:
-    """构造 ``session/request_permission`` 的处理函数：**挂起**，等 ``/aapprove``。
+def build_permission_handler(
+    session: T.Any,
+    label: str = "",
+    *,
+    settings_provider: T.Callable[[], T.Any] | None = None,
+) -> T.Callable:
+    """构造 ``session/request_permission`` 的处理函数。
 
-    审批开关与策略都在 alkaid0 自己的配置里，插件这边不自动批准、也不主动拒绝：
-
-    * 收到请求就返回 :data:`acp.client.DEFERRED`（先不回包），由业务层在聊天里
-      提示「⏳ 工具审批：…（回复 /aapprove 允许）」；
-    * 用户发 ``/aapprove`` 才回 ``allow_once``（见 ``main.approve_tool``）；
-    * 用户不发批准、直接继续发消息时，alkaid0 会把这次审批当作拒绝，客户端只要
-      在新一轮 prompt 前清掉挂起记录即可（``ACPClient.clear_deferred``）。
+    命中「配置白名单 / 本轮提示词授权 / 外部钩子授权」就立即回 ``allow_once``，
+    否则维持旧行为：返回 :data:`acp.client.DEFERRED`，请求挂起、往聊天里提示，
+    等群友发 ``/aapprove`` 才回包。
 
     Args:
-        session: 审批请求落在哪个群会话上（日志 / 兜底标签用）。
+        session: 审批请求落在哪个群会话上（日志 / 授权缓存在它身上）。
         label: 日志里用来辨认群的标签（缺省用 ``session.key``）。
+        settings_provider: 返回 :class:`RunnerSettings`（或同名字段映射）的函数；
+            每次审批现读，配置改了下一条审批就生效。
 
     Returns:
-        一个 ``async (params) -> DEFERRED`` 的协程函数，直接塞给
+        一个 ``async (params) -> result | DEFERRED`` 的协程函数，直接塞给
         :attr:`acp.client.ACPClient.permission_handler` 即可。
     """
-
-    async def _handle(params: dict) -> T.Any:
-        title = str((params or {}).get("title") or "").strip() or "工具调用"
-        logger.info(
-            "%s: %s 请求审批「%s」，先挂起；在聊天里发 /aapprove 放行",
-            LOG_PREFIX,
-            label or getattr(session, "key", "会话"),
-            title,
-        )
-        return DEFERRED
-
-    return _handle
+    return approval_mod.build_permission_handler(
+        session, label=label, settings_provider=settings_provider
+    )
 
 
 # ── 过程消息回显 ──────────────────────────────────────────────────────
@@ -718,6 +769,10 @@ class _TurnTranscript:
                 progress.append(item["text"])
         _flush()
         return "\n\n".join(blocks).strip()
+
+
+#: 公开别名：唤醒钩子把 cron 回合的输出转发到群里时复用同一套拼装逻辑。
+TurnTranscript = _TurnTranscript
 
 
 # ── 远端斜杠命令（/acmd）──────────────────────────────────────────────
@@ -1055,7 +1110,9 @@ class Alkaid0Runner(BaseAgentRunner[AstrAgentContext]):
             return
 
         session.client.set_permission_handler(
-            build_permission_handler(session, label=key)
+            build_permission_handler(
+                session, label=key, settings_provider=lambda: self._settings
+            )
         )
 
         try:
@@ -1108,6 +1165,16 @@ class Alkaid0Runner(BaseAgentRunner[AstrAgentContext]):
         #: 已经提示过的审批请求（同一条只发一次）；没有挂起请求时只发一次通用提示。
         approval_seen: set[int] = set()
         approval_generic = False
+        #: 自动批准的序号起点：新自动批准一次，这个数就会变大。
+        approval_seq = int(getattr(session, "approval_seq", 0))
+        prompt_text, prompt_grant = approval_mod.extract_prompt_grant(
+            prompt_text,
+            enabled=settings.auto_approve_enable and settings.auto_approve_prompt,
+        )
+        session.set_prompt_grant(prompt_grant)
+        if not prompt_text:
+            # 只写了授权标记：不能把空提示词发给 alkaid0；给一句无害的继续语。
+            prompt_text = "继续"
 
         def _accumulate(target: dict[str, str], seq: list[str], mid: str, text: str) -> None:
             """按 messageId 累积思考文本（先记顺序，chunk 追加）。"""
@@ -1206,17 +1273,31 @@ class Alkaid0Runner(BaseAgentRunner[AstrAgentContext]):
                         error_msg = str(update.get(acp.KEY_ERROR_MSG) or "")
                         break
                     if state == acp.STATE_REQUIRES_ACTION:
-                        # 审批提示是**必要信息**（用户得知道可以 /aapprove），
-                        # 不受 echo_events 开关影响；同一个挂起请求只提示一次。
-                        pending = _pending_permission(session)
-                        if pending is not None:
+                        # 服务和客户端是两个任务：requires_action 先到、审批请求
+                        # 后到。等一小会儿再判定，免得自动批准了还发「等审批」。
+                        req_state, pending = await approval_mod.wait_permission_state(
+                            session, approval_seq
+                        )
+                        if req_state == "auto":
+                            approval_seq = int(
+                                getattr(session, "approval_seq", approval_seq)
+                            )
+                            logger.info(
+                                "%s: 群 %s 本轮工具审批已自动放行，不发等待提示",
+                                LOG_PREFIX,
+                                session.key,
+                            )
+                            continue
+                        if req_state == "manual" and pending is not None:
                             if pending[0] in approval_seen:
                                 continue
                             approval_seen.add(pending[0])
-                        elif approval_generic:
-                            continue
-                        else:
+                        elif req_state == "unknown":
+                            if approval_generic:
+                                continue
                             approval_generic = True
+                        else:
+                            continue
                         hint = permission_hint(session)
                         logger.info("%s: 群 %s %s", LOG_PREFIX, session.key, hint)
                         transcript.add_progress(hint)
@@ -1249,6 +1330,7 @@ class Alkaid0Runner(BaseAgentRunner[AstrAgentContext]):
                 else:
                     logger.debug("%s: 群 %s 忽略事件 %s", LOG_PREFIX, session.key, kind)
         finally:
+            session.clear_prompt_grant()
             unsubscribe()
 
         if stop_reason == acp.STOP_REASON_CANCELLED:

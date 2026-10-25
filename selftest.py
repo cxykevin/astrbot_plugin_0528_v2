@@ -25,13 +25,17 @@
   的解析与「开会话前挂监听才收得到」、与 alcoh 同步的服务端文案对照表（声明能力才翻，
   否则照原文）、命令文本自动补 ``/``、命令轮的通知消费（正文 / 无输出 / refusal 报错 /
   cancelled 不算错 / 掉线速报 / 等不到 idle 按超时）；
+* 定时任务与 ``/acron``（代码不设权限门禁，交给 AstrBot 上层）：``/acron`` 列本群会话的任务、
+  ``/acron remove <id>`` 先 ``cron/list`` 确认归属再 ``cron/delete``、``all`` 已移除、失败提示；
 * 中止当前轮与 ``/astop``：``session/cancel`` 走**通知**（没有 id、不等回包）、
   没在跑 / 连接池没起来 / 发不出去都如实上报、排队的插话在回执里被点名、
   被中止的一轮照发半截正文并标出「本轮已终止」；
 * 上下文用量与 ``/actx``：``usage_update`` 的解析（缺字段当 0、坏值不算）、会话缓存与
   换 / 新开会话时清空、重连续接同一会话时保留、``context x% (used/size)`` 的渲染口径
   （整数截断、封顶 100%、窗口未知只报已用）、命令各分支（没池子 / 没会话 / 没跑过 / 正常上报）；
-* 工具审批：请求挂起（不回包）、聊天里发提示、``/aapprove`` 回 ``allow_once``；
+* 工具审批：默认挂起（不回包）、聊天里发提示、``/aapprove`` 回放行项；直通（Auto-Approve）
+  的授权解析、配置白名单 / 提示词标记 / 外部钩子、自动回包与「不发等待提示」、
+  外部授权 TTL 与失败清理；
 
 用法（在 AstrBot 仓库中，使用该实例的 uv 环境）::
 
@@ -44,6 +48,7 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 import json
 import os
 import shutil
@@ -53,7 +58,7 @@ import time
 from pathlib import Path
 from types import MappingProxyType, SimpleNamespace
 
-_REPO_ROOT = Path(__file__).resolve().parents[2]
+_REPO_ROOT = Path(__file__).resolve().parents[3]
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 os.environ.setdefault("ASTRBOT_DISABLE_METRICS", "1")
@@ -64,8 +69,11 @@ from data.plugins.astrbot_plugin_0528_v2 import agent_runner as runner_mod
 from data.plugins.astrbot_plugin_0528_v2 import main as own_main
 from data.plugins.astrbot_plugin_0528_v2 import panel as panel_mod
 from data.plugins.astrbot_plugin_0528_v2 import prerequisite as prereq_mod
+from data.plugins.astrbot_plugin_0528_v2 import proactive as proactive_mod
 from data.plugins.astrbot_plugin_0528_v2 import remote_config as remote_mod
 from data.plugins.astrbot_plugin_0528_v2 import turn_queue as turn_queue_mod
+from data.plugins.astrbot_plugin_0528_v2 import wakeup_hook as wakeup_mod
+from data.plugins.astrbot_plugin_0528_v2.acp import approval as approval_mod
 from data.plugins.astrbot_plugin_0528_v2.acp import commands as acp_commands
 from data.plugins.astrbot_plugin_0528_v2.acp import pool as pool_mod
 from data.plugins.astrbot_plugin_0528_v2.acp import protocol as acp_proto
@@ -1129,6 +1137,315 @@ check(
     f"{_before} / {_probe_responses}",
 )
 
+# --------------------------------------------------- 12b. 工具审批直通（Auto-Approve）
+_AUTO_PERMISSION = {
+    "title": "Approve tool call: edit",
+    "options": [{"optionId": "reject_once"}, {"optionId": "allow_once"}],
+}
+_READ_PERMISSION = {
+    "title": "Approve tool call: read",
+    "options": [{"optionId": "allow_once"}],
+}
+
+
+def _auto_session():
+    """带真实授权缓存方法的会话（底层客户端只需要 pending_permission）。"""
+    return pool_mod.GroupSession(
+        key="group:auto",
+        url="ws://stub/acp",
+        cwd="/w/auto",
+        client=SimpleNamespace(pending_permission=lambda: None),
+    )
+
+
+def _auto_settings(**overrides):
+    values = {
+        "auto_approve_enable": True,
+        "auto_approve_tools": "",
+        "auto_approve_prompt": True,
+        "auto_approve_hook": True,
+    }
+    values.update(overrides)
+    return SimpleNamespace(**values)
+
+
+check(
+    "工具名清单解析：逗号 / 空白 / 通配 / 全部工具 / 空值",
+    approval_mod.parse_tool_list("read, EDIT\nGrep；*.py ; all")
+    == (frozenset({"read", "edit", "grep", "*.py"}), True)
+    and approval_mod.parse_tool_list("") == (frozenset(), False)
+    and approval_mod.parse_tool_list(None) == (frozenset(), False)
+    and approval_mod.parse_tool_list(True) == (frozenset(), True)
+    and approval_mod.parse_tool_list("true") == (frozenset(), True)
+    and approval_mod.parse_tool_list("false") == (frozenset(), False)
+    and approval_mod.parse_tool_list("no") == (frozenset(), False)
+    and approval_mod.parse_tool_list(["read", True]) == (frozenset(), True)
+    and approval_mod.parse_tool_list(42) == (frozenset(), False),
+    str(approval_mod.parse_tool_list("read, EDIT\nGrep；*.py ; all")),
+)
+check(
+    "授权匹配：大小写不敏感、支持 * / ? 通配，all_tools 放行一切",
+    approval_mod.ApprovalGrant(names=frozenset({"read*"})).allows("READ_FILE")
+    and approval_mod.ApprovalGrant(names=frozenset({"re?d"})).allows("read")
+    and not approval_mod.ApprovalGrant(names=frozenset({"read"})).allows("edit")
+    and approval_mod.ApprovalGrant(all_tools=True).allows("anything")
+    and not approval_mod.ApprovalGrant().allows("read")
+    and not approval_mod.ApprovalGrant(all_tools=True).allows(""),
+)
+_config_grant = approval_mod.grant_from_value("read", source="配置白名单")
+_prompt_grant = approval_mod.grant_from_value("edit", source="提示词")
+_merged_grant = approval_mod.merge_grants(
+    _config_grant, _prompt_grant, approval_mod.EMPTY_GRANT
+)
+check(
+    "多份授权合并：任一放行即放行，来源按顺序记下",
+    _merged_grant.allows("read")
+    and _merged_grant.allows("EDIT")
+    and not _merged_grant.allows("write")
+    and _merged_grant.source == "配置白名单、提示词"
+    and approval_mod.matching_source(
+        [_config_grant, _prompt_grant], "EDIT"
+    )
+    == "提示词"
+    and approval_mod.matching_source([_config_grant, _prompt_grant], "write") == "",
+    str(_merged_grant),
+)
+check(
+    "从审批请求里取工具名：calling_info > [Call xxx] > Approve tool call 标题",
+    approval_mod.tool_name_of(
+        {
+            "subject": {
+                "toolCall": {
+                    "title": "[Call edit]call_1",
+                    "content": [
+                        {"type": acp_proto.KEY_CALLING_INFO, "name": "Read"}
+                    ],
+                }
+            }
+        }
+    )
+    == "Read"
+    and approval_mod.tool_name_of(
+        {"subject": {"toolCall": {"title": "[Call edit]call_1"}}}
+    )
+    == "edit"
+    and approval_mod.tool_name_of({"title": "Approve tool call: write"}) == "write"
+    and approval_mod.tool_name_of({"title": "edit"}) == "edit"
+    and approval_mod.tool_name_of({"kind": "edit"}) == ""
+    and approval_mod.tool_name_of({"title": "Approve tool call:"}) == ""
+    and approval_mod.tool_name_of(None) == "",
+)
+check(
+    "放行选项：优先 allow_once、忽略拒绝项、没有放行项时不乱选",
+    approval_mod.permission_option(
+        {
+            "options": [
+                {"optionId": "reject_once"},
+                {"optionId": "allow_always", "kind": "allow_always"},
+                {"optionId": "allow_once"},
+            ]
+        }
+    )
+    == "allow_once"
+    and approval_mod.permission_option(
+        {"options": [{"optionId": "custom", "kind": "allow"}]}
+    )
+    == "custom"
+    and approval_mod.permission_option(
+        {"options": [{"optionId": "reject_once"}]}
+    )
+    == ""
+    and approval_mod.permission_option({"options": "oops"}) == ""
+    and approval_mod.approval_result(_AUTO_PERMISSION)
+    == {"outcome": "selected", "optionId": "allow_once"}
+    and approval_mod.approval_result(
+        {"options": [{"optionId": "reject_once"}]}
+    )
+    is None,
+    str(approval_mod.permission_option(_AUTO_PERMISSION)),
+)
+check(
+    "提示词授权标记：英文 / 中文 / 全放行 / 多标记，清理后不留标记",
+    approval_mod.extract_prompt_grant(
+        "帮我看下这个\n\n[auto_approve: read, EDIT]", enabled=True
+    )
+    == (
+        "帮我看下这个",
+        approval_mod.ApprovalGrant(
+            names=frozenset({"read", "edit"}), source="提示词"
+        ),
+    )
+    and approval_mod.extract_prompt_grant(
+        "做事 [auto_approve]", enabled=True
+    )
+    == ("做事", approval_mod.ApprovalGrant(all_tools=True, source="提示词"))
+    and approval_mod.extract_prompt_grant(
+        "【自动批准：read，grep】", enabled=True
+    )[1].names
+    == frozenset({"read", "grep"})
+    and approval_mod.extract_prompt_grant(
+        "[auto_approve: read]\n正文\n[auto_approve: edit]", enabled=True
+    )[1].names
+    == frozenset({"read", "edit"}),
+    str(
+        approval_mod.extract_prompt_grant(
+            "帮我看下这个\n\n[auto_approve: read, EDIT]", enabled=True
+        )
+    ),
+)
+check(
+    "提示词授权标记：关闭时原样保留、没有标记时不动正文",
+    approval_mod.extract_prompt_grant(
+        "帮我看下 [auto_approve: read]", enabled=False
+    )
+    == (
+        "帮我看下 [auto_approve: read]",
+        approval_mod.EMPTY_GRANT,
+    )
+    and approval_mod.extract_prompt_grant("普通消息", enabled=True)
+    == ("普通消息", approval_mod.EMPTY_GRANT),
+)
+
+
+async def _auto_approve_checks():
+    """审批处理函数：三层授权 / 兜底挂起 / 授权过期 / 等审批状态。"""
+    disabled = _auto_settings(auto_approve_enable=False)
+    handler = approval_mod.build_permission_handler(
+        _auto_session(), settings_provider=lambda: disabled
+    )
+    check(
+        "总开关关闭：即使配了白名单也先挂起",
+        await handler(
+            {
+                "title": "Approve tool call: edit",
+                "options": [{"optionId": "allow_once"}],
+            }
+        )
+        is DEFERRED,
+    )
+
+    empty = _auto_settings()
+    empty_session = _auto_session()
+    empty_handler = approval_mod.build_permission_handler(
+        empty_session, settings_provider=lambda: empty
+    )
+    check(
+        "开启但三层都没命中：维持旧行为挂起",
+        await empty_handler(_AUTO_PERMISSION) is DEFERRED
+        and empty_session.approval_seq == 0,
+    )
+
+    config_session = _auto_session()
+    config_handler = approval_mod.build_permission_handler(
+        config_session,
+        settings_provider=lambda: _auto_settings(auto_approve_tools="edi*"),
+    )
+    config_result = await config_handler(_AUTO_PERMISSION)
+    check(
+        "配置白名单命中：直接回 allow_once，并记一笔自动批准",
+        config_result == {"outcome": "selected", "optionId": "allow_once"}
+        and config_session.approval_seq == 1
+        and config_session.last_approval["tool"] == "edit"
+        and config_session.last_approval["source"] == "配置白名单",
+        f"{config_result} / {config_session.last_approval}",
+    )
+
+    prompt_session = _auto_session()
+    prompt_session.set_prompt_grant(
+        approval_mod.grant_from_value("read", source="提示词")
+    )
+    prompt_handler = approval_mod.build_permission_handler(
+        prompt_session, settings_provider=lambda: _auto_settings()
+    )
+    check(
+        "提示词授权：只放行本轮写明的工具",
+        await prompt_handler(_READ_PERMISSION)
+        == {"outcome": "selected", "optionId": "allow_once"}
+        and await prompt_handler(_AUTO_PERMISSION) is DEFERRED,
+    )
+    prompt_off_handler = approval_mod.build_permission_handler(
+        _auto_session(),
+        settings_provider=lambda: _auto_settings(auto_approve_prompt=False),
+    )
+    check(
+        "关掉提示词授权时忽略标记带来的授权（总开关仍开着）",
+        await prompt_off_handler(_READ_PERMISSION) is DEFERRED,
+    )
+
+    external_session = _auto_session()
+    external_session.set_external_grant(
+        approval_mod.grant_from_value("read", source="外部钩子"), ttl=60
+    )
+    external_handler = approval_mod.build_permission_handler(
+        external_session, settings_provider=lambda: _auto_settings()
+    )
+    check(
+        "外部钩子授权有效期内放行，关掉开关后忽略",
+        await external_handler(_READ_PERMISSION)
+        == {"outcome": "selected", "optionId": "allow_once"},
+    )
+    external_off_handler = approval_mod.build_permission_handler(
+        external_session,
+        settings_provider=lambda: _auto_settings(auto_approve_hook=False),
+    )
+    check(
+        "关掉外部钩子授权后即便缓存还在也挂起",
+        await external_off_handler(_READ_PERMISSION) is DEFERRED,
+    )
+    external_session.external_grant_expires = time.monotonic() - 1
+    check(
+        "外部授权过期后自动作废",
+        external_session.active_external_grant() is approval_mod.EMPTY_GRANT,
+    )
+
+    no_option_handler = approval_mod.build_permission_handler(
+        _auto_session(),
+        settings_provider=lambda: _auto_settings(auto_approve_tools="*"),
+    )
+    check(
+        "命中授权但服务端没给放行选项：不误选，照旧挂起",
+        await no_option_handler(
+            {"title": "Approve tool call: edit", "options": [{"optionId": "reject_once"}]}
+        )
+        is DEFERRED,
+    )
+
+    def _broken_settings():
+        raise RuntimeError("配置坏了")
+
+    broken_handler = approval_mod.build_permission_handler(
+        _auto_session(), settings_provider=_broken_settings
+    )
+    check(
+        "读配置失败时按「不自动批准」处理，不炸审批通道",
+        await broken_handler(_AUTO_PERMISSION) is DEFERRED,
+    )
+
+    manual_session = _auto_session()
+    manual_session.client.pending_permission = lambda: (9, _AUTO_PERMISSION)
+    check(
+        "wait_permission_state：挂起请求 → manual",
+        await approval_mod.wait_permission_state(manual_session, 0, timeout=0.01)
+        == ("manual", (9, _AUTO_PERMISSION)),
+    )
+    auto_session = _auto_session()
+    auto_session.approval_seq = 3
+    check(
+        "wait_permission_state：自动批准序号变了 → auto",
+        await approval_mod.wait_permission_state(auto_session, 2, timeout=0.01)
+        == ("auto", None),
+    )
+    check(
+        "wait_permission_state：都没有 → unknown（不无限等）",
+        await approval_mod.wait_permission_state(
+            _auto_session(), 0, timeout=0.01
+        )
+        == ("unknown", None),
+    )
+
+
+asyncio.run(_auto_approve_checks())
+
 # --------------------------------------------------- 13. 群连接池 + Runner（假客户端）
 def _session_config_options(current="0/a", effort="unset"):
     """假 alkaid0 的 ``configOptions``（模型 + 推理强度，形状同真机）。"""
@@ -1182,6 +1499,8 @@ class FakeClient:
         fail_prompt=None,
         fail_cancel=None,
         existing_cwds=None,
+        crons=None,
+        fail_cron=None,
     ):
         self.url = url
         self.name = name
@@ -1224,6 +1543,10 @@ class FakeClient:
         self.session_list_cursor = ""
         #: 非空时 ``session/list`` 直接报错（模拟「目录没初始化」等）。
         self.session_list_error = None
+        #: 定时任务：``{cwd: [job, ...]}``（形状同 alkaid0 的 cron/list 响应）。
+        self.crons = json.loads(json.dumps(crons or {}))
+        #: 非空时 ``session/cron/*`` 直接报错（模拟服务端不支持 / 任务已不在）。
+        self.fail_cron = fail_cron
 
     async def connect(self):
         if self.fail_connect:
@@ -1268,6 +1591,7 @@ class FakeClient:
         self.resume_replay = replay_from
         if self.fail_resume:
             raise ACPError(f"{self.name}：续接 {session_id} 失败")
+        self._session_cwds[session_id] = cwd
         self._broadcast_commands(session_id)
         return {"configOptions": json.loads(json.dumps(self.config_options))}
 
@@ -1279,6 +1603,32 @@ class FakeClient:
         if self.session_list_cursor:
             payload["nextCursor"] = self.session_list_cursor
         return payload
+
+    def _cron_cwd(self, session_id):
+        """定时任务按 cwd 存（真机 cron/list 只看当前会话的工作目录）。"""
+        return self._session_cwds.get(session_id) or session_id.rsplit(":", 1)[-1]
+
+    async def cron_list(self, session_id, *, timeout=None):
+        """模拟 ``session/cron/list``：按会话 cwd 返回任务表，可整体报错。"""
+        self.calls.append(("session/cron/list", {"sessionId": session_id}))
+        if self.fail_cron:
+            raise ACPError(self.fail_cron)
+        return {"jobs": json.loads(json.dumps(self.crons.get(self._cron_cwd(session_id), [])))}
+
+    async def cron_delete(self, session_id, job_id, *, timeout=None):
+        """模拟 ``session/cron/delete``：从对应 cwd 的任务表里删掉一条。"""
+        self.calls.append(
+            ("session/cron/delete", {"sessionId": session_id, "id": int(job_id)})
+        )
+        if self.fail_cron:
+            raise ACPError(self.fail_cron)
+        cwd = self._cron_cwd(session_id)
+        jobs = self.crons.setdefault(cwd, [])
+        remaining = [job for job in jobs if job.get("id") != int(job_id)]
+        if len(remaining) == len(jobs):
+            raise ACPError(f"job not found: {job_id}")
+        self.crons[cwd] = remaining
+        return {"id": int(job_id)}
 
     async def session_set_config_option(
         self, session_id, config_id, value, *, type="id", timeout=None
@@ -1337,6 +1687,23 @@ class FakeClient:
     def set_permission_handler(self, handler):
         self.permission_handler = handler
 
+    async def request_permission(self, request_id, params):
+        """模拟服务端发来 ``session/request_permission``，走当前处理函数。"""
+        handler = self.permission_handler
+        if handler is None:
+            return None
+        result = handler(params)
+        if asyncio.iscoroutine(result):
+            result = await result
+        if result is DEFERRED:
+            self.deferred_requests[request_id] = {
+                "method": "session/request_permission",
+                "params": params,
+            }
+        else:
+            self.replied_requests.append((request_id, result))
+        return result
+
     def pending_permission(self):
         """模拟 ACPClient.pending_permission：找挂着的审批请求。"""
         for request_id, info in self.deferred_requests.items():
@@ -1367,6 +1734,38 @@ class FakeClient:
                 self._handlers.remove(handler)
 
         return _unsubscribe
+
+
+class AutoPermissionClient(FakeClient):
+    """一轮里服务端先报 requires_action、随后才发审批请求（真机顺序）。"""
+
+    def __init__(self, url, name, *, request_delay=0.03):
+        super().__init__(url, name)
+        self.request_delay = request_delay
+        self.permission_result = None
+        self.prompt_text = ""
+
+    async def session_prompt(self, session_id, text, timeout=None):
+        self.calls.append(("session/prompt", {"sessionId": session_id, "text": text}))
+        self.prompt_text = text
+        self._broadcast(session_id, {"sessionUpdate": "state_update", "state": "running"})
+        self._broadcast(
+            session_id, {"sessionUpdate": "state_update", "state": "requires_action"}
+        )
+        await asyncio.sleep(self.request_delay)
+        self.permission_result = await self.request_permission(1, _AUTO_PERMISSION)
+        self._broadcast(
+            session_id,
+            {
+                "sessionUpdate": "agent_message_chunk",
+                "messageId": "msg_auto",
+                "content": {"type": "text", "text": "已改好"},
+            },
+        )
+        self._broadcast(
+            session_id, {"sessionUpdate": "state_update", "state": "idle", "stopReason": "end_turn"}
+        )
+        return {}
 
 
 def _chain_text(chain):
@@ -1659,6 +2058,72 @@ async def alkaid0_checks():
         "连接池没起来时 /areset 只提示不报错",
         "连接池还没启动" in "\n".join(no_pool_event.replies),
         "\n".join(no_pool_event.replies),
+    )
+
+    # ── /aclean 命令（强制回收连接，保留会话记录）────────
+    clean_store = store_mod.SessionStore(db_dir / "clean.db")
+    clean_created = []
+
+    def clean_factory(url, name):
+        client = FakeClient(url, name)
+        clean_created.append(client)
+        return client
+
+    clean_plugin = Plugin0528V2(
+        context=None, config={"enforce_prerequisite": False}
+    )
+    clean_plugin._pool = pool_mod.SessionPool(
+        client_factory=clean_factory, idle_timeout=300, store=clean_store
+    )
+    clean_event = FakeCommandEvent("aiocqhttp:group:889")
+    clean_session = await clean_plugin._pool.acquire(
+        clean_event.unified_msg_origin, url="ws://acp", cwd="/w/889"
+    )
+    clean_sid = clean_session.session_id
+
+    clean_event.replies.clear()
+    async with clean_session.lock:
+        clean_replies = [chunk async for chunk in clean_plugin.clean_session(clean_event)]
+    clean_text = "\n".join(clean_event.replies)
+    check(
+        "/aclean 强制回收连接（不等在跑的一轮结束，保留记录）",
+        len(clean_replies) == 1
+        and clean_plugin._pool.peek(clean_event.unified_msg_origin) is None
+        and clean_created[0].closed
+        and ("session/close", {"sessionId": clean_sid}) in clean_created[0].calls
+        and clean_store.get(clean_event.unified_msg_origin) == clean_sid
+        and "已强制回收本群的 ACP 连接" in clean_text
+        and "刚才正在跑的那一轮已被断开" in clean_text,
+        f"{clean_text} / {clean_created[0].calls}",
+    )
+    resumed_clean = await clean_plugin._pool.acquire(
+        clean_event.unified_msg_origin, url="ws://acp", cwd="/w/889"
+    )
+    check(
+        "/aclean 之后下一条消息续接同一个会话（不是 /areset 的新会话）",
+        resumed_clean.session_id == clean_sid
+        and ("session/resume", {"sessionId": clean_sid, "cwd": "/w/889"})
+        in clean_created[1].calls
+        and not [call for call in clean_created[1].calls if call[0] == "session/new"],
+        str(clean_created[1].calls),
+    )
+
+    clean_idle_event = FakeCommandEvent("aiocqhttp:group:890")
+    [chunk async for chunk in clean_plugin.clean_session(clean_idle_event)]
+    check(
+        "/aclean 没有活跃连接时如实说明",
+        "没有活跃的 ACP 连接" in "\n".join(clean_idle_event.replies),
+        "\n".join(clean_idle_event.replies),
+    )
+    no_pool_clean_event = FakeCommandEvent("aiocqhttp:group:891")
+    no_pool_clean_plugin = Plugin0528V2(
+        context=None, config={"enforce_prerequisite": False}
+    )
+    [chunk async for chunk in no_pool_clean_plugin.clean_session(no_pool_clean_event)]
+    check(
+        "连接池没起来时 /aclean 只提示不报错",
+        "连接池还没启动" in "\n".join(no_pool_clean_event.replies),
+        "\n".join(no_pool_clean_event.replies),
     )
 
     # ── /astop 命令（中止当前轮）───────────────────────
@@ -3139,6 +3604,266 @@ async def alkaid0_checks():
         "\n".join(acmd_down_event.replies),
     )
 
+    # ── /acron 命令（列本会话 + 删除）────────────────────
+    CRON_CAPABILITIES = {
+        acp_commands.CAPABILITY_ALKAID0_V04: {},
+        acp_proto.CAPABILITY_CRON: {},
+    }
+    check(
+        "定时任务扩展：方法名与能力标记（扩展文档 §3.11）",
+        acp_proto.CAPABILITY_CRON == "alk.cxykevin.top/cron"
+        and acp_proto.METHOD_CRON_LIST == "alk.cxykevin.top/session/cron/list"
+        and acp_proto.METHOD_CRON_DELETE == "alk.cxykevin.top/session/cron/delete",
+        f"{acp_proto.CAPABILITY_CRON} / {acp_proto.METHOD_CRON_LIST}",
+    )
+    check(
+        "parse_cron_job_id：只认正整数",
+        own_main.parse_cron_job_id("12") == 12
+        and own_main.parse_cron_job_id(" 3 ") == 3
+        and own_main.parse_cron_job_id("0") is None
+        and own_main.parse_cron_job_id("-1") is None
+        and own_main.parse_cron_job_id("abc") is None
+        and own_main.parse_cron_job_id("") is None,
+    )
+
+    cron_store = store_mod.SessionStore(db_dir / "cron.db")
+    cron_store.remember("aiocqhttp:group:691", "sess_691:/w/691", "/w/691")
+    cron_jobs = {
+        "/w/691": [
+            {
+                "id": 1,
+                "cron": "0 9 * * *",
+                "prompt": "每天九点汇报",
+                "runOnce": False,
+                "workdir": "/w/691",
+                "nextRuns": ["2026-10-25 09:00:00 GMT+8"],
+            },
+            {
+                "id": 2,
+                "cron": "0 18 * * 5",
+                "prompt": "周五写周报",
+                "runOnce": True,
+                "workdir": "/w/691",
+                "nextRuns": [],
+            },
+        ],
+    }
+    cron_created = []
+
+    def cron_factory(url, name):
+        client = FakeClient(
+            url, name, capabilities=CRON_CAPABILITIES, crons=cron_jobs
+        )
+        cron_created.append(client)
+        return client
+
+    cron_plugin = Plugin0528V2(
+        context=None,
+        config={
+            "enforce_prerequisite": False,
+            "acp_url": "ws://acp",
+            "workspace_template": "/w/{groupid}",
+        },
+    )
+    cron_plugin._pool = pool_mod.SessionPool(
+        client_factory=cron_factory, idle_timeout=300, store=cron_store
+    )
+
+    cron_list_event = FakeCommandEvent("aiocqhttp:group:691")
+    [chunk async for chunk in cron_plugin.cronjobs(cron_list_event, "")]
+    cron_list = "\n".join(cron_list_event.replies)
+    check(
+        "/acron 列出本群会话的任务（id / 表达式 / 周期 / 下次 / 提示词）",
+        "本群会话的定时任务（2 个）:" in cron_list
+        and "- 1. 0 9 * * *  周期  下次 2026-10-25 09:00:00 GMT+8" in cron_list
+        and "每天九点汇报" in cron_list
+        and "- 2. 0 18 * * 5  一次性" in cron_list
+        and "周五写周报" in cron_list
+        and "用法：/acron" in cron_list,
+        cron_list,
+    )
+    check(
+        "/acron 会续接本群记录里的会话（不乱开新会话）",
+        cron_plugin._pool.peek("aiocqhttp:group:691").session_id
+        == "sess_691:/w/691"
+        and ("session/resume", {"sessionId": "sess_691:/w/691", "cwd": "/w/691"})
+        in cron_created[0].calls
+        and not [call for call in cron_created[0].calls if call[0] == "session/new"],
+        str(cron_created[0].calls),
+    )
+
+    cron_remove_event = FakeCommandEvent("aiocqhttp:group:691")
+    [chunk async for chunk in cron_plugin.cronjobs(cron_remove_event, "remove 2")]
+    cron_removed = "\n".join(cron_remove_event.replies)
+    check(
+        "/acron remove <id> 删除本群会话的任务（只回结果，不再列剩下的）",
+        cron_removed == "已删除本群会话的定时任务 2。"
+        and (
+            "session/cron/delete",
+            {"sessionId": "sess_691:/w/691", "id": 2},
+        )
+        in cron_created[0].calls,
+        cron_removed,
+    )
+    check(
+        "删除前会再次确认任务属于本会话（续接记录里的会话，不用新开会话）",
+        ("session/resume", {"sessionId": "sess_691:/w/691", "cwd": "/w/691"})
+        in cron_created[0].calls
+        and len(
+            [call for call in cron_created[0].calls if call[0] == "session/cron/list"]
+        )
+        == 2
+        and not [call for call in cron_created[0].calls if call[0] == "session/new"],
+        str(cron_created[0].calls),
+    )
+    check(
+        "只删掉指定的那条任务",
+        [job["id"] for job in cron_created[0].crons["/w/691"]] == [1],
+        str(cron_created[0].crons),
+    )
+
+    delete_calls_before = len(
+        [call for call in cron_created[0].calls if call[0] == "session/cron/delete"]
+    )
+    cron_missing_event = FakeCommandEvent("aiocqhttp:group:691")
+    [chunk async for chunk in cron_plugin.cronjobs(cron_missing_event, "remove 99")]
+    check(
+        "/acron remove 不存在的 id：如实说，不发删除请求",
+        "没有 id 为 99 的定时任务" in "\n".join(cron_missing_event.replies)
+        and len(
+            [call for call in cron_created[0].calls if call[0] == "session/cron/delete"]
+        )
+        == delete_calls_before,
+        "\n".join(cron_missing_event.replies),
+    )
+
+    cron_bad_id_event = FakeCommandEvent("aiocqhttp:group:691")
+    [chunk async for chunk in cron_plugin.cronjobs(cron_bad_id_event, "remove abc")]
+    check(
+        "/acron remove 非数字 id 被拒绝",
+        "任务 id 必须是正整数" in "\n".join(cron_bad_id_event.replies),
+        "\n".join(cron_bad_id_event.replies),
+    )
+
+    cron_usage_event = FakeCommandEvent("aiocqhttp:group:691")
+    [chunk async for chunk in cron_plugin.cronjobs(cron_usage_event, "remove")]
+    cron_extra_event = FakeCommandEvent("aiocqhttp:group:691")
+    [chunk async for chunk in cron_plugin.cronjobs(cron_extra_event, "remove 1 2")]
+    check(
+        "/acron remove 少参数 / 多参数时给用法",
+        "用法：/acron remove <id>" in "\n".join(cron_usage_event.replies)
+        and "用法：/acron remove <id>" in "\n".join(cron_extra_event.replies),
+        f"{cron_usage_event.replies} / {cron_extra_event.replies}",
+    )
+
+    cron_unknown_event = FakeCommandEvent("aiocqhttp:group:691")
+    [chunk async for chunk in cron_plugin.cronjobs(cron_unknown_event, "all")]
+    check(
+        "/acron all 已移除（按不认识的参数提示用法）",
+        "不认识的参数：all" in "\n".join(cron_unknown_event.replies),
+        "\n".join(cron_unknown_event.replies),
+    )
+
+    # 删除失败：服务端说任务没了，如实回给用户
+    original_cron_delete = cron_created[0].cron_delete
+
+    async def _failing_cron_delete(session_id, job_id, *, timeout=None):
+        raise ACPError(f"job not found: {job_id}")
+
+    cron_created[0].cron_delete = _failing_cron_delete
+    cron_delete_fail_event = FakeCommandEvent("aiocqhttp:group:691")
+    [chunk async for chunk in cron_plugin.cronjobs(cron_delete_fail_event, "remove 1")]
+    check(
+        "/acron remove 删除失败时如实上报",
+        "删除失败：job not found: 1"
+        in "\n".join(cron_delete_fail_event.replies),
+        "\n".join(cron_delete_fail_event.replies),
+    )
+    cron_created[0].cron_delete = original_cron_delete
+
+    # 读取失败 / 服务端没声明能力 / 连接池没起来
+    cron_read_fail_event = FakeCommandEvent("aiocqhttp:group:691")
+    cron_created[0].fail_cron = "cron backend down"
+    [chunk async for chunk in cron_plugin.cronjobs(cron_read_fail_event, "remove 1")]
+    check(
+        "/acron remove 读取失败时如实上报",
+        "读取定时任务失败：cron backend down"
+        in "\n".join(cron_read_fail_event.replies),
+        "\n".join(cron_read_fail_event.replies),
+    )
+    cron_created[0].fail_cron = None
+
+    no_cron_cap_created = []
+
+    def no_cron_cap_factory(url, name):
+        client = FakeClient(url, name)
+        no_cron_cap_created.append(client)
+        return client
+
+    no_cron_cap_plugin = Plugin0528V2(
+        context=None,
+        config={
+            "enforce_prerequisite": False,
+            "acp_url": "ws://acp",
+            "workspace_template": "/w/{groupid}",
+        },
+    )
+    no_cron_cap_plugin._pool = pool_mod.SessionPool(
+        client_factory=no_cron_cap_factory, idle_timeout=300
+    )
+    no_cron_cap_event = FakeCommandEvent("aiocqhttp:group:693")
+    [chunk async for chunk in no_cron_cap_plugin.cronjobs(no_cron_cap_event, "remove 1")]
+    check(
+        "服务端没声明 cron 能力时如实说明",
+        "没有声明 cron 能力" in "\n".join(no_cron_cap_event.replies)
+        and not [
+            call for call in no_cron_cap_created[0].calls if call[0] == "session/cron/list"
+        ],
+        "\n".join(no_cron_cap_event.replies),
+    )
+
+    no_pool_cron_event = FakeCommandEvent("aiocqhttp:group:694")
+    no_pool_cron_plugin = Plugin0528V2(
+        context=None, config={"enforce_prerequisite": False}
+    )
+    [chunk async for chunk in no_pool_cron_plugin.cronjobs(no_pool_cron_event, "remove 1")]
+    check(
+        "连接池没起来时 /acron 只提示不报错",
+        "连接池还没启动" in "\n".join(no_pool_cron_event.replies),
+        "\n".join(no_pool_cron_event.replies),
+    )
+
+    # 客户端把 cron/* 包成 ACP 请求
+    async def _stub_cron_call(method, params=None, *, timeout=None):
+        stub_captured.update(method=method, params=params, timeout=timeout)
+        return {"jobs": [{"id": 3, "cron": "* * * * *"}]}
+
+    stub_client.call = _stub_cron_call
+    stub_cron_result = await stub_client.cron_list("sess_9:/w")
+    check(
+        "客户端把 cron_list 包成 ACP 请求（删除前校验用）",
+        stub_captured
+        == {
+            "method": acp_proto.METHOD_CRON_LIST,
+            "params": {"sessionId": "sess_9:/w"},
+            "timeout": None,
+        }
+        and stub_cron_result["jobs"][0]["id"] == 3,
+        str(stub_captured),
+    )
+    stub_cron_deleted = await stub_client.cron_delete("sess_9:/w", "3")
+    check(
+        "客户端把 cron_delete 包成 ACP 请求（id 转成整数）",
+        stub_captured
+        == {
+            "method": acp_proto.METHOD_CRON_DELETE,
+            "params": {"sessionId": "sess_9:/w", "id": 3},
+            "timeout": None,
+        }
+        and stub_cron_deleted["jobs"][0]["id"] == 3,
+        str(stub_captured),
+    )
+
     # ── run_slash_command 的边角（直接调）────────────────
     cancel_pool = pool_mod.SessionPool(
         client_factory=lambda url, name: FakeClient(
@@ -3387,14 +4112,16 @@ async def alkaid0_checks():
         str(runner_created[0].calls),
     )
     check(
-        "一轮结束后解绑本轮订阅，只留会话自己的常驻监听（配置项 / 命令列表 / 用量）",
-        len(runner_created[0]._handlers) == 3
+        "一轮结束后解绑本轮订阅，只留会话自己的常驻监听（配置项 / 命令列表 / 用量 / 送达）",
+        len(runner_created[0]._handlers) == 4
         and "_listen_config_options"
         in getattr(runner_created[0]._handlers[0], "__qualname__", "")
         and "_listen_available_commands"
         in getattr(runner_created[0]._handlers[1], "__qualname__", "")
         and "_listen_usage"
-        in getattr(runner_created[0]._handlers[2], "__qualname__", ""),
+        in getattr(runner_created[0]._handlers[2], "__qualname__", "")
+        and "_listen_delivery"
+        in getattr(runner_created[0]._handlers[3], "__qualname__", ""),
         str(runner_created[0]._handlers),
     )
     check("给连接装上了审批处理函数", callable(runner_created[0].permission_handler))
@@ -3433,6 +4160,57 @@ async def alkaid0_checks():
     )
     await muted_runner.close()
     await muted_pool.close_all()
+
+    # ── 自动批准：提示词标记 + requires_action 早于审批请求 ──
+    auto_created = []
+
+    def auto_factory(url, name):
+        client = AutoPermissionClient(url, name)
+        auto_created.append(client)
+        return client
+
+    auto_pool = pool_mod.SessionPool(client_factory=auto_factory, idle_timeout=300)
+    auto_runner = runner_mod.Alkaid0Runner(
+        auto_pool, {"acp_url": "ws://plugin/acp"}
+    )
+    auto_event = FakeEvent(
+        group_id="778", session_id="778", umo="aiocqhttp:group:778"
+    )
+    await auto_runner.reset(
+        request=SimpleNamespace(prompt="改一下这个 [auto_approve: edit]"),
+        run_context=SimpleNamespace(context=SimpleNamespace(event=auto_event)),
+        agent_hooks=None,
+        provider_config={
+            "acp_url": "ws://panel/acp",
+            "auto_approve_enable": True,
+            "auto_approve_prompt": True,
+        },
+        streaming=False,
+    )
+    auto_responses = [response async for response in auto_runner.step_until_done()]
+    auto_text = _chain_text(auto_responses[-1].data["chain"])
+    auto_session = auto_pool.peek("aiocqhttp:group:778")
+    check(
+        "提示词授权标记会在发给 alkaid0 前删掉",
+        auto_created[0].prompt_text == "改一下这个",
+        auto_created[0].prompt_text,
+    )
+    check(
+        "requires_action 先到、审批请求后到：自动批准且不发「等待审批」提示",
+        auto_created[0].permission_result
+        == {"outcome": "selected", "optionId": "allow_once"}
+        and auto_created[0].replied_requests
+        == [(1, {"outcome": "selected", "optionId": "allow_once"})]
+        and "工具审批" not in auto_text
+        and auto_text == "已改好",
+        f"{auto_created[0].replied_requests} / {auto_text}",
+    )
+    check(
+        "本轮结束后清掉提示词授权（不会漏到下一轮）",
+        auto_session is not None and auto_session.prompt_grant is None,
+    )
+    await auto_runner.close()
+    await auto_pool.close_all()
 
     # ── 出错路径：idle + error_msg ─────────────────────
     error_updates = [
@@ -3577,6 +4355,634 @@ async def _no_reap_when_disabled(pool):
 
 asyncio.run(alkaid0_checks())
 
+
+# --------------------------------------------------- 13b. 主动推送（没有本地 prompt 的回合）
+async def proactive_checks():
+    """cron / 其它客户端发起的回合：常驻监听收集正文并主动发到群里。"""
+    sent = []
+
+    async def send(key, text):
+        sent.append((key, text))
+        return True
+
+    settings = runner_mod.RunnerSettings.from_config(
+        {"echo_events": True, "turn_timeout_sec": 5}, None
+    )
+    relay = proactive_mod.ProactiveRelay(
+        settings_provider=lambda: settings, send_text=send
+    )
+    created = []
+
+    def factory(url, name):
+        client = FakeClient(url, name)
+        created.append(client)
+        return client
+
+    pool = pool_mod.SessionPool(client_factory=factory, idle_timeout=300)
+    relay.bind(pool)
+    session = await pool.acquire("group:push", url="ws://acp", cwd="/w/push")
+    client = created[0]
+    sid = session.session_id
+
+    async def wait_done(timeout=2.0):
+        deadline = time.monotonic() + timeout
+        while relay._active and time.monotonic() < deadline:  # noqa: ASYNC110
+            await asyncio.sleep(0.01)
+        await asyncio.sleep(0.02)
+
+    # 一场没有本地 prompt 的回合（cron 就是这样：user_message + running）
+    client._broadcast(
+        sid,
+        {
+            "sessionUpdate": "user_message",
+            "messageId": "u1",
+            "content": [{"type": "text", "text": "[cronjob] 提醒一下"}],
+        },
+    )
+    client._broadcast(sid, {"sessionUpdate": "state_update", "state": "running"})
+    await asyncio.sleep(0.02)
+    check(
+        "主动回合也标成 busy：空闲回收不会把连接从中间收走",
+        session.proactive_active
+        and session.busy
+        and await pool.reap_idle() == []
+        and pool.peek("group:push") is session,
+        f"proactive={session.proactive_active} busy={session.busy}",
+    )
+    session.last_active -= 1000
+    check(
+        "即使空闲计时超时，主动回合进行中也不回收",
+        await pool.reap_idle() == [] and session.connected,
+    )
+    client._broadcast(
+        sid,
+        {
+            "sessionUpdate": "agent_message_chunk",
+            "messageId": "m1",
+            "content": {"type": "text", "text": "时间到了。"},
+        },
+    )
+    await asyncio.sleep(0.1)
+    check(
+        "主动回合正文边收边发（不等 idle 才整段推）",
+        bool(sent)
+        and sent[0][0] == "group:push"
+        and "时间到了。" in sent[0][1],
+        str(sent),
+    )
+    client._broadcast(
+        sid,
+        {
+            "sessionUpdate": "agent_message_chunk",
+            "messageId": "m1",
+            "content": {"type": "text", "text": "该起来了。"},
+        },
+    )
+    client._broadcast(
+        sid,
+        {
+            "sessionUpdate": "tool_call_update",
+            "toolCallId": "t1",
+            "title": "[Call read]",
+            "status": "completed",
+            "content": [
+                {
+                    "type": "alk.cxykevin.top/calling_info",
+                    "name": "read",
+                    "args": "{}",
+                }
+            ],
+        },
+    )
+    client._broadcast(
+        sid, {"sessionUpdate": "state_update", "state": "idle", "stopReason": "end_turn"}
+    )
+    await wait_done()
+    streamed = "\n".join(text for _, text in sent)
+    check(
+        "没有本地 prompt 的回合：正文流式推、过程回显也发到群聊",
+        len(sent) >= 3
+        and all(key == "group:push" for key, _ in sent)
+        and "时间到了。" in streamed
+        and "该起来了。" in streamed
+        and "🔧 调用 read（已完成）" in streamed,
+        str(sent),
+    )
+    check(
+        "主动回合结束后清掉活动状态（不会一直挂着）",
+        relay._active == {} and session.proactive_active is False,
+        f"{relay._active} / {session.proactive_active}",
+    )
+
+    # 本地回合（持会话锁）不能被主动推送重复收集
+    sent.clear()
+    async with session.lock:
+        client._broadcast(sid, {"sessionUpdate": "state_update", "state": "running"})
+        client._broadcast(
+            sid,
+            {
+                "sessionUpdate": "agent_message_chunk",
+                "messageId": "m2",
+                "content": {"type": "text", "text": "本地回合"},
+            },
+        )
+        client._broadcast(
+            sid, {"sessionUpdate": "state_update", "state": "idle", "stopReason": "end_turn"}
+        )
+        await asyncio.sleep(0.05)
+    check(
+        "本地回合持锁时不会触发主动推送（避免和 Runner 抢同一段输出）",
+        sent == [] and relay._active == {},
+        f"{sent} / {relay._active}",
+    )
+
+    # 唤醒钩子接管时也不重复
+    sent.clear()
+    session.external_relay = True
+    client._broadcast(sid, {"sessionUpdate": "state_update", "state": "running"})
+    client._broadcast(
+        sid,
+        {
+            "sessionUpdate": "agent_message_chunk",
+            "messageId": "m3",
+            "content": {"type": "text", "text": "钩子接管"},
+        },
+    )
+    client._broadcast(
+        sid, {"sessionUpdate": "state_update", "state": "idle", "stopReason": "end_turn"}
+    )
+    await asyncio.sleep(0.05)
+    session.external_relay = False
+    check(
+        "唤醒钩子接管时主动推送不插手（避免群里收到两份）",
+        sent == [] and relay._active == {},
+        f"{sent} / {relay._active}",
+    )
+
+    # 主动回合里等审批：提示 /aapprove
+    sent.clear()
+    client.deferred_requests = {
+        9: {
+            "method": "session/request_permission",
+            "params": {"title": "edit", "options": [{"optionId": "allow_once"}]},
+        }
+    }
+    client._broadcast(sid, {"sessionUpdate": "state_update", "state": "running"})
+    client._broadcast(sid, {"sessionUpdate": "state_update", "state": "requires_action"})
+    client._broadcast(
+        sid, {"sessionUpdate": "state_update", "state": "idle", "stopReason": "end_turn"}
+    )
+    await wait_done()
+    check(
+        "主动回合等审批时也发 /aapprove 提示",
+        len(sent) == 1 and "⏳ 工具审批：edit" in sent[0][1],
+        str(sent),
+    )
+    client.deferred_requests = {}
+
+    # 出错 / 中止：正文照发并带上状态
+    sent.clear()
+    client._broadcast(sid, {"sessionUpdate": "state_update", "state": "running"})
+    client._broadcast(
+        sid,
+        {
+            "sessionUpdate": "agent_message_chunk",
+            "messageId": "m4",
+            "content": {"type": "text", "text": "做到一半"},
+        },
+    )
+    client._broadcast(
+        sid,
+        {
+            "sessionUpdate": "state_update",
+            "state": "idle",
+            "stopReason": "refusal",
+            "alk.cxykevin.top/error_msg": "模型报错",
+        },
+    )
+    await wait_done()
+    error_stream = "\n".join(text for _, text in sent)
+    check(
+        "主动回合出错时保留已产出的正文并带上原因",
+        "做到一半" in error_stream and "⚠️ 模型报错" in error_stream,
+        str(sent),
+    )
+
+    # 强制回收前可以取消正在收集的主动回合（不会再把半截内容发出去）
+    sent.clear()
+    client._broadcast(sid, {"sessionUpdate": "state_update", "state": "running"})
+    client._broadcast(
+        sid,
+        {
+            "sessionUpdate": "agent_message_chunk",
+            "messageId": "m-cancel",
+            "content": {"type": "text", "text": "取消我"},
+        },
+    )
+    await asyncio.sleep(0.02)
+    relay.cancel("group:push")
+    await asyncio.sleep(0.05)
+    check(
+        "主动回合可被取消（强制回收时不再推半截内容）",
+        sent == []
+        and relay._active == {}
+        and session.proactive_active is False
+        and session.busy is False,
+        f"{sent} / {relay._active} / {session.proactive_active}",
+    )
+
+    await relay.stop()
+    check("停止主动推送后清空活动状态", relay._active == {})
+    await pool.close_all()
+
+
+asyncio.run(proactive_checks())
+
+
+# --------------------------------------------------- 13c. 唤醒钩子（cron HTTP）
+async def wakeup_checks():
+    """唤醒钩子：会话 ID 解析 / 记录匹配 / curl 命令，以及两条唤醒路径。"""
+    _wake_params = [
+        param.name
+        for param in inspect.signature(
+            wakeup_mod.WakeupHookService.handle_wakeup
+        ).parameters.values()
+        if param.name != "self"
+        and param.kind
+        in (
+            inspect.Parameter.POSITIONAL_ONLY,
+            inspect.Parameter.POSITIONAL_OR_KEYWORD,
+            inspect.Parameter.KEYWORD_ONLY,
+        )
+    ]
+    check(
+        "handle_wakeup 不接收 request 形参（AstrBot 从 web.request 上下文取请求）",
+        _wake_params == [],
+        str(_wake_params),
+    )
+    check(
+        "clean_path：统一斜杠、去掉尾随分隔符与 . 段",
+        wakeup_mod.clean_path(" /w//a/./b/ ") == "/w/a/b"
+        and wakeup_mod.clean_path("") == ""
+        and wakeup_mod.clean_path(".") == ".",
+    )
+    check(
+        "parse_session_token：认完整 ID / 纯会话号，其余拒绝",
+        wakeup_mod.parse_session_token("sess_12:/w/x") == ("full", "sess_12:/w/x")
+        and wakeup_mod.parse_session_token("12") == ("id", "12")
+        and wakeup_mod.parse_session_token("sess_12") == ("id", "12")
+        and wakeup_mod.parse_session_token("sess_x:/w") == ("", "")
+        and wakeup_mod.parse_session_token("abc") == ("", "")
+        and wakeup_mod.parse_session_token("") == ("", ""),
+    )
+    entries = [
+        {"key": "group:a", "sessionId": "sess_12:/w/x", "cwd": "/w/x", "updatedAt": 1},
+        {"key": "group:b", "sessionId": "sess_12:/w/y", "cwd": "/w/y", "updatedAt": 2},
+        {"key": "group:c", "sessionId": "sess_13:/w/x", "cwd": "/w/x", "updatedAt": 3},
+    ]
+    check(
+        "match_bindings：按完整 ID / 会话号 + cwd 找群，最近活动在前",
+        [item["key"] for item in wakeup_mod.match_bindings(entries, "sess_12:/w/x")]
+        == ["group:a"]
+        and [item["key"] for item in wakeup_mod.match_bindings(entries, "12", "/w/x")]
+        == ["group:a"]
+        and [item["key"] for item in wakeup_mod.match_bindings(entries, "12")]
+        == ["group:b", "group:a"]
+        and wakeup_mod.match_bindings(entries, "nope") == [],
+        str(wakeup_mod.match_bindings(entries, "12")),
+    )
+    command = wakeup_mod.build_hook_command(
+        "http://127.0.0.1:6186/", PLUGIN_NAME, 30
+    )
+    auto_command = wakeup_mod.build_hook_command(
+        "http://127.0.0.1:6186/", PLUGIN_NAME, 30, "read, edit"
+    )
+    key_command = wakeup_mod.build_hook_command(
+        "http://127.0.0.1:6186/",
+        PLUGIN_NAME,
+        30,
+        "read, edit",
+        "astrbot-raw-key",
+        "second-secret",
+    )
+    check(
+        "build_hook_command：tag 编码、带超时与 SESSION_ID",
+        f"{wakeup_mod.HOOK_PATH}?tag={PLUGIN_NAME}" in command
+        and "$SESSION_ID" in command
+        and "-m 40" in command
+        and "6186/api/v1/plugins/extensions" in command
+        and "X-API-Key" not in command,
+        command,
+    )
+    check(
+        "build_hook_command：AstrBot Key 与插件口令明文写进请求头（不走环境变量）",
+        f"{wakeup_mod.API_KEY_HEADER}: astrbot-raw-key" in key_command
+        and f"{wakeup_mod.PLUGIN_KEY_HEADER}: second-secret" in key_command
+        and "$" not in key_command.split("X-API-Key")[1].split("'")[0]
+        and wakeup_mod.HOOK_ENV_KEY not in key_command
+        and wakeup_mod.HOOK_PLUGIN_ENV_KEY not in key_command,
+        key_command,
+    )
+    check(
+        "build_hook_command：cron 的自动批准清单写进 auto_approve 查询参数",
+        "auto_approve=" not in command
+        and "auto_approve=read,%20edit" in auto_command
+        and "&tag=" not in auto_command,
+        auto_command,
+    )
+    check(
+        "is_our_hook：按 tag 认出自己写的命令",
+        wakeup_mod.is_our_hook(command, PLUGIN_NAME)
+        and not wakeup_mod.is_our_hook("curl http://x/other", PLUGIN_NAME),
+    )
+    settings = wakeup_mod.WakeupSettings.from_config(
+        {
+            "wakeup_enable": "true",
+            "wakeup_api_key": " k ",
+            "wakeup_public_url": " https://bot.example/ ",
+            "wakeup_wait_sec": "7",
+            "wakeup_relay_reply": "no",
+            "wakeup_auto_approve": " read, edit ",
+        }
+    )
+    check(
+        "WakeupSettings：配置解析 / 可用性 / 公网地址优先",
+        settings.enabled
+        and settings.api_key == "k"
+        and settings.wait_sec == 7
+        and settings.relay is False
+        and settings.auto_approve == "read, edit"
+        and settings.usable
+        and settings.base_url("http://127.0.0.1:6185") == "https://bot.example",
+        str(settings),
+    )
+
+    sent = []
+
+    async def send(key, text):
+        sent.append((key, text))
+        return True
+
+    class RelayClient(FakeClient):
+        """续接成功后立刻回放一整轮 cron 对话（模拟服务端已在跑）。"""
+
+        async def session_resume(self, session_id, cwd, **kwargs):
+            result = await super().session_resume(session_id, cwd, **kwargs)
+            self._broadcast(
+                session_id,
+                {
+                    "sessionUpdate": "user_message",
+                    "messageId": "u-cron",
+                    "content": [{"type": "text", "text": "[cronjob] 提醒"}],
+                },
+            )
+            self._broadcast(
+                session_id, {"sessionUpdate": "state_update", "state": "running"}
+            )
+            self._broadcast(
+                session_id,
+                {
+                    "sessionUpdate": "agent_message_chunk",
+                    "messageId": "m-cron",
+                    "content": {"type": "text", "text": "cron 到点了"},
+                },
+            )
+            self._broadcast(
+                session_id,
+                {
+                    "sessionUpdate": "state_update",
+                    "state": "idle",
+                    "stopReason": "end_turn",
+                },
+            )
+            return result
+
+    db_dir = Path(tempfile.mkdtemp(prefix="0528v2-wake-"))
+    store = store_mod.SessionStore(db_dir / "wake.db")
+    store.remember("group:cron", "sess_77:/w/cron", "/w/cron")
+    created = []
+
+    def relay_factory(url, name):
+        client = RelayClient(url, name)
+        created.append(client)
+        return client
+
+    pool = pool_mod.SessionPool(client_factory=relay_factory, idle_timeout=300)
+    service = wakeup_mod.WakeupHookService(
+        plugin_name=PLUGIN_NAME,
+        config_provider=lambda: {"wakeup_wait_sec": 2, "wakeup_relay_reply": True},
+        runner_settings_provider=lambda: runner_mod.RunnerSettings.from_config(
+            {"turn_timeout_sec": 5, "echo_events": True}, None
+        ),
+        store_provider=lambda: store,
+        pool_provider=lambda: pool,
+        send_text=send,
+    )
+    result = await service.wake("sess_77:/w/cron", "/w/cron")
+    for _ in range(200):  # noqa: ASYNC110
+        if sent:
+            break
+        await asyncio.sleep(0.01)
+    check(
+        "没有活跃连接时：唤醒钩子续接会话并转发 cron 回合",
+        result.get("ok") is True
+        and result.get("bindings", [{}])[0].get("relay") is True
+        and sent
+        and sent[0][0] == "group:cron"
+        and "cron 到点了" in sent[0][1]
+        and ("session/resume", {"sessionId": "sess_77:/w/cron", "cwd": "/w/cron"})
+        in created[0].calls,
+        f"{result} / {sent} / {created[0].calls if created else []}",
+    )
+    check(
+        "转发结束后清掉外部接管标记",
+        pool.peek("group:cron").external_relay is False,
+    )
+    await service.stop()
+    await pool.close_all()
+
+    # 已有活跃连接：钩子只等消息送达，不拿会话锁，也不重复转发
+    sent.clear()
+    live_store = store_mod.SessionStore(db_dir / "live.db")
+    live_store.remember("group:live", "sess_88:/w/live", "/w/live")
+    live_created = []
+
+    def live_factory(url, name):
+        client = FakeClient(url, name)
+        live_created.append(client)
+        return client
+
+    live_pool = pool_mod.SessionPool(
+        client_factory=live_factory, idle_timeout=300, store=live_store
+    )
+    live_session = await live_pool.acquire(
+        "group:live", url="ws://acp", cwd="/w/live"
+    )
+    live_service = wakeup_mod.WakeupHookService(
+        plugin_name=PLUGIN_NAME,
+        config_provider=lambda: {"wakeup_wait_sec": 2, "wakeup_relay_reply": True},
+        runner_settings_provider=lambda: runner_mod.RunnerSettings.from_config(
+            {"acp_url": "ws://acp", "turn_timeout_sec": 5}, None
+        ),
+        store_provider=lambda: live_store,
+        pool_provider=lambda: live_pool,
+        send_text=send,
+    )
+    live_task = asyncio.create_task(
+        live_service.wake("sess_88:/w/live", "/w/live")
+    )
+    await asyncio.sleep(0.05)
+    check(
+        "已有活跃连接时唤醒钩子不抢会话锁（否则主动推送会被挡住）",
+        not live_session.lock.locked(),
+    )
+    live_created[0]._broadcast(
+        live_session.session_id,
+        {
+            "sessionUpdate": "agent_message_chunk",
+            "messageId": "m-live",
+            "content": {"type": "text", "text": "活跃连接收到"},
+        },
+    )
+    live_result = await live_task
+    await asyncio.sleep(0.02)
+    check(
+        "活跃连接路径：只报告送达，不自己转发（交给常驻主动推送）",
+        live_result.get("ok") is True
+        and live_result.get("bindings", [{}])[0].get("relay") is False
+        and live_result.get("bindings", [{}])[0].get("received") is True
+        and sent == []
+        and live_session.external_relay is False,
+        f"{live_result} / {sent}",
+    )
+    await live_service.stop()
+    await live_pool.close_all()
+
+    # 外部钩子的自动批准：只在总开关 + auto_approve_hook 都开着时生效
+    grant_store = store_mod.SessionStore(db_dir / "grant.db")
+    grant_store.remember("group:grant", "sess_99:/w/grant", "/w/grant")
+    grant_created = []
+
+    def grant_factory(url, name):
+        client = FakeClient(url, name)
+        grant_created.append(client)
+        return client
+
+    grant_pool = pool_mod.SessionPool(
+        client_factory=grant_factory, idle_timeout=300, store=grant_store
+    )
+    grant_session = await grant_pool.acquire(
+        "group:grant", url="ws://acp", cwd="/w/grant"
+    )
+    grant_service = wakeup_mod.WakeupHookService(
+        plugin_name=PLUGIN_NAME,
+        config_provider=lambda: {"wakeup_wait_sec": 0, "wakeup_relay_reply": False},
+        runner_settings_provider=lambda: runner_mod.RunnerSettings.from_config(
+            {
+                "acp_url": "ws://acp",
+                "auto_approve_enable": True,
+                "auto_approve_hook": True,
+            },
+            None,
+        ),
+        store_provider=lambda: grant_store,
+        pool_provider=lambda: grant_pool,
+        send_text=send,
+    )
+    await grant_service.wake(
+        "sess_99:/w/grant", "/w/grant", auto_approve="read, edit"
+    )
+    grant = grant_session.active_external_grant()
+    check(
+        "外部钩子授权：请求里的 true / 工具清单会挂到连接上（按 TTL 过期）",
+        grant.allows("read")
+        and grant.allows("EDIT")
+        and not grant.allows("write")
+        and grant_session.external_grant_expires > time.monotonic(),
+        str(grant_session.last_approval),
+    )
+
+    off_service = wakeup_mod.WakeupHookService(
+        plugin_name=PLUGIN_NAME,
+        config_provider=lambda: {"wakeup_wait_sec": 0, "wakeup_relay_reply": False},
+        runner_settings_provider=lambda: runner_mod.RunnerSettings.from_config(
+            {
+                "acp_url": "ws://acp",
+                "auto_approve_enable": True,
+                "auto_approve_hook": False,
+            },
+            None,
+        ),
+        store_provider=lambda: grant_store,
+        pool_provider=lambda: grant_pool,
+        send_text=send,
+    )
+    await off_service.wake(
+        "sess_99:/w/grant", "/w/grant", auto_approve="read"
+    )
+    check(
+        "关掉 auto_approve_hook 后外部钩子的授权被忽略（缓存也清掉）",
+        grant_session.external_grant is None
+        and grant_session.external_grant_expires == 0.0,
+        str(grant_session.external_grant),
+    )
+    await grant_service.wake(
+        "sess_99:/w/grant", "/w/grant", auto_approve="read"
+    )
+    await grant_service.wake(
+        "sess_99:/w/grant", "/w/grant", auto_approve="false"
+    )
+    check(
+        "外部钩子传 false 表示不放行，并清掉上一份授权",
+        grant_session.external_grant is None
+        and not grant_session.active_external_grant().allows("read"),
+    )
+
+    # 唤醒失败（续接不上）：这次授权不能漏给下一轮本地对话
+    fail_store = store_mod.SessionStore(db_dir / "grant-fail.db")
+    fail_store.remember("group:gfail", "sess_100:/w/gfail", "/w/gfail")
+    fail_pool = pool_mod.SessionPool(
+        client_factory=lambda url, name: FakeClient(url, name, fail_resume=True),
+        idle_timeout=300,
+        store=fail_store,
+    )
+    fail_session = await fail_pool.prepare(
+        "group:gfail", url="ws://acp", cwd="/w/gfail"
+    )
+    fail_service = wakeup_mod.WakeupHookService(
+        plugin_name=PLUGIN_NAME,
+        config_provider=lambda: {"wakeup_wait_sec": 1, "wakeup_relay_reply": True},
+        runner_settings_provider=lambda: runner_mod.RunnerSettings.from_config(
+            {
+                "acp_url": "ws://acp",
+                "auto_approve_enable": True,
+                "auto_approve_hook": True,
+            },
+            None,
+        ),
+        store_provider=lambda: fail_store,
+        pool_provider=lambda: fail_pool,
+        send_text=send,
+    )
+    fail_result = await fail_service.wake(
+        "sess_100:/w/gfail", "/w/gfail", auto_approve="*"
+    )
+    check(
+        "唤醒续接失败时清掉外部授权（不会漏到下一轮本地对话）",
+        fail_result.get("ok") is False
+        and fail_result.get("error") == "wake_failed"
+        and fail_session.external_grant is None
+        and fail_session.external_grant_expires == 0.0,
+        f"{fail_result} / {fail_session.external_grant}",
+    )
+    await fail_service.stop()
+    await fail_pool.close_all()
+    await grant_service.stop()
+    await grant_pool.close_all()
+
+
+asyncio.run(wakeup_checks())
+
 # --------------------------------------------------- 14. 执行器注册（librunner 在场时）
 try:
     from data.plugins.astrbot_plugin_librunner.api import (
@@ -3635,6 +5041,16 @@ check(
         "turn_timeout_sec",
         "echo_events",
         "show_thought",
+        "auto_approve_enable",
+        "auto_approve_tools",
+        "auto_approve_prompt",
+        "auto_approve_hook",
+        "wakeup_enable",
+        "wakeup_api_key",
+        "wakeup_public_url",
+        "wakeup_wait_sec",
+        "wakeup_relay_reply",
+        "wakeup_auto_approve",
     },
     str(sorted(schema)),
 )
@@ -3657,6 +5073,10 @@ check(
         "turn_timeout_sec",
         "echo_events",
         "show_thought",
+        "auto_approve_enable",
+        "auto_approve_tools",
+        "auto_approve_prompt",
+        "auto_approve_hook",
     }
     and set(runner_mod.RUNNER_CONFIG_METADATA) == set(runner_mod.RUNNER_CONFIG_DEFAULT),
     str(sorted(runner_mod.RUNNER_CONFIG_DEFAULT)),
@@ -4127,13 +5547,22 @@ def _panel_fields(snapshot):
     }
 
 
-def _new_panel_service(config, *, panel_values=None, after_save=None):
+def _new_panel_service(
+    config,
+    *,
+    panel_values=None,
+    after_save=None,
+    hook_action=None,
+    hook_status_provider=None,
+):
     return panel_mod.PanelService(
         config,
         plugin_name=PLUGIN_NAME,
         version=PLUGIN_VERSION,
         panel_config_provider=lambda: panel_values or {},
         after_save=after_save,
+        hook_action=hook_action,
+        hook_status_provider=hook_status_provider,
     )
 
 
@@ -4510,7 +5939,7 @@ async def panel_checks():
         and fields["acp_url"]["title"] == schema["acp_url"]["description"]
         and fields["acp_url"]["hint"] == schema["acp_url"]["hint"]
         and [group["key"] for group in snapshot["groups"]]
-        == ["prerequisites", "connection", "workspace", "chat"],
+        == ["prerequisites", "connection", "workspace", "chat", "auto_approve", "wakeup"],
         json.dumps(snapshot, ensure_ascii=False),
     )
     check(
@@ -4519,6 +5948,63 @@ async def panel_checks():
         and fields["echo_events"]["effective"] is False
         and fields["idle_timeout_sec"]["overridden"] is False,
         str(fields["echo_events"]),
+    )
+
+    # ── cron 钩子：保存配置不会自动同步，只有面板按钮才动 alkaid0 ──
+    hook_calls = []
+
+    async def _hook_action(action):
+        hook_calls.append(action)
+        install = action == "install"
+        return {
+            "ok": True,
+            "installed": install,
+            "note": "已写入" if install else "已移除",
+            "endpoint": "http://127.0.0.1:6186/wakeup",
+            "command": "curl ..." if install else "",
+        }
+
+    hook_service = _new_panel_service(
+        _panel_config(),
+        hook_action=_hook_action,
+        hook_status_provider=lambda: {
+            "installed": None,
+            "note": "",
+            "endpoint": "http://127.0.0.1:6186/wakeup",
+            "usable": True,
+        },
+    )
+    hook_snapshot = hook_service.snapshot()
+    installed_hook = await hook_service.apply_hook_action("install")
+    removed_hook = await hook_service.apply_hook_action("remove")
+    invalid_hook = await hook_service.apply_hook_action("nope")
+    check(
+        "面板快照：附带 cron 钩子现状（按钮据此决定能不能点）",
+        hook_snapshot["hook"]["usable"] is True
+        and hook_snapshot["hook"]["endpoint"].endswith("/wakeup"),
+        str(hook_snapshot.get("hook")),
+    )
+    check(
+        "手动钩子按钮：写入 / 移除不经过配置文件保存",
+        installed_hook.ok
+        and installed_hook.data["installed"] is True
+        and installed_hook.data["note"] == "已写入"
+        and removed_hook.ok
+        and removed_hook.data["installed"] is False
+        and invalid_hook.code == "bad_payload"
+        and hook_calls == ["install", "remove"],
+        f"{hook_calls} / {installed_hook} / {removed_hook} / {invalid_hook}",
+    )
+
+    hook_web = _FakeWebContext()
+    hook_service.register(hook_web)
+    check(
+        "面板为钩子按钮注册 POST panel/hook",
+        any(
+            api[0] == f"/{PLUGIN_NAME}/panel/hook" and api[2] == ["POST"]
+            for api in hook_web.registered_web_apis
+        ),
+        str(hook_web.registered_web_apis),
     )
 
     saved = await service.apply(

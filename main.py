@@ -16,7 +16,10 @@
    ``/astop`` 中止本群正在跑的那一轮（思考中 / 跑工具时都能叫停）；
    ``/amodel`` 查看 / 切换本群会话使用的模型、``/aeffort`` 调推理强度
    （都是会话级，只动这一个群）；``/aresume`` 列出本群工作目录下的历史会话
-   （或切回其中某一个）；``/acmd`` 列出并执行远端（alkaid0）自己的斜杠命令。
+   （或切回其中某一个）；``/acmd`` 列出并执行远端（alkaid0）自己的斜杠命令；
+   ``/aclean`` 强制回收本群连接（保留会话记录，下一条消息续接）；
+   ``/acron`` 列出本群会话的定时任务、``/acron remove <id>`` 删除其中一条
+   （服务端需声明 ``alk.cxykevin.top/cron``）；命令权限交给 AstrBot 上层配置。
 
 两个前置插件的完整 API 说明、参数语义、示例与坑都在插件目录下的 ``PLUGIN_APIS.md``
 里（本地开发参考文档，已在 ``.gitignore`` 中排除，**不要提交进仓库**）。
@@ -25,6 +28,7 @@
 from __future__ import annotations
 
 import contextlib
+from collections.abc import Mapping, MutableMapping
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -32,12 +36,16 @@ from typing import Any
 from astrbot.api import logger
 from astrbot.api.event import AstrMessageEvent, filter
 from astrbot.api.star import Context, Star
+from astrbot.core.message.message_event_result import MessageChain
 from astrbot.core.star.filter.command import GreedyStr
 
 from . import agent_runner as runner_mod
 from . import panel as panel_mod
 from . import prerequisite as prerequisite_mod
+from . import proactive as proactive_mod
 from . import remote_config as remote_config_mod
+from . import wakeup_hook as wakeup_mod
+from .acp import approval as approval_mod
 from .acp import commands as acp_commands
 from .acp import pool as pool_mod
 from .acp import protocol as acp_protocol
@@ -49,7 +57,7 @@ from .turn_queue import TurnQueue
 PLUGIN_NAME = "astrbot_plugin_0528_v2"
 
 #: 插件版本（与 metadata.yaml 的 version 保持一致）。
-PLUGIN_VERSION = "v0.2.0"
+PLUGIN_VERSION = "v0.3.0"
 
 #: 日志前缀。
 LOG_PREFIX = prerequisite_mod.LOG_PREFIX
@@ -254,6 +262,47 @@ def render_context_usage(usage: tuple[int, int] | None) -> str:
     return f"context {min(int(used / size * 100), 100)}% ({used}/{size})"
 
 
+#: ``/acron`` 的用法说明。
+CRON_COMMAND_HELP = (
+    "用法：/acron 列出本群会话的定时任务，/acron remove <id> 删除其中一条"
+)
+
+
+def parse_cron_job_id(token: str) -> int | None:
+    """把 ``/acron remove`` 的参数解析成正整数任务 id；不合法返回 ``None``。"""
+    text = (token or "").strip()
+    if not text.isdigit():
+        return None
+    value = int(text)
+    return value if value > 0 else None
+
+
+def _one_line(text: object, limit: int = 60) -> str:
+    """把多行文本压成一行并截断（任务提示词可能很长）。"""
+    raw = " ".join(str(text or "").split())
+    return f"{raw[: limit - 1]}…" if len(raw) > limit else raw
+
+
+def render_cron_jobs(jobs: list[dict]) -> str:
+    """渲染本群会话的定时任务（id / cron / 周期 / 下次触发 / 提示词摘要）。"""
+    if not jobs:
+        return f"本群会话没有定时任务。\n{CRON_COMMAND_HELP}"
+    lines = [f"本群会话的定时任务（{len(jobs)} 个）:"]
+    for job in jobs:
+        kind = "一次性" if job.get("runOnce") else "周期"
+        next_runs = job.get("nextRuns")
+        next_text = f"  下次 {next_runs[0]}" if isinstance(next_runs, list) and next_runs else ""
+        lines.append(
+            f"- {job.get('id', '?')}. {str(job.get('cron') or '?').strip()}"
+            f"  {kind}{next_text}"
+        )
+        prompt = _one_line(job.get("prompt"))
+        if prompt:
+            lines.append(f"    {prompt}")
+    lines.append(CRON_COMMAND_HELP)
+    return "\n".join(lines)
+
+
 #: 状态命令会把生效地址发到群里，所以地址脱敏由 :mod:`panel` 统一处理
 #: （``?key=***``、userinfo 里的密码也会打码）。
 
@@ -288,11 +337,33 @@ class Plugin0528V2(Star):
             version=PLUGIN_VERSION,
             panel_config_provider=self._panel_config,
             after_save=self._after_panel_save,
+            hook_action=self._panel_hook_action,
+            hook_status_provider=self._panel_hook_status,
+            hook_status_async_provider=self._panel_hook_status_async,
         )
         #: alkaid0 全局配置的远程读写（走 ACP config/get|set|reload）。
         self._remote_config = remote_config_mod.RemoteConfigService(
             plugin_name=PLUGIN_NAME,
             url_provider=lambda: self._settings().url,
+        )
+        #: 唤醒钩子：复用 AstrBot 自己的 Web 端口（注册成插件 Web API）。
+        self._hook = wakeup_mod.WakeupHookService(
+            plugin_name=PLUGIN_NAME,
+            config_provider=lambda: self.plugin_config,
+            runner_settings_provider=self._settings,
+            store_provider=self._ensure_store,
+            pool_provider=lambda: self._pool,
+            send_text=self._send_to_chat,
+            dashboard_base_provider=self._dashboard_base,
+        )
+        #: 最近一次手动写入 / 移除 alkaid0 cron 钩子的结果（面板与状态命令展示）。
+        self._hook_sync_note = ""
+        #: 本插件写的钩子当前是否在 alkaid0 里；``None`` 表示还没手动同步过。
+        self._hook_installed: bool | None = None
+        #: 没有本地 prompt 的主动回合（cron 唤醒 / 其它客户端发起）→ 推回群聊。
+        self._proactive = proactive_mod.ProactiveRelay(
+            settings_provider=self._settings,
+            send_text=self._send_to_chat,
         )
 
     # ------------------------------------------------------------ 生命周期
@@ -300,10 +371,12 @@ class Plugin0528V2(Star):
         """插件启用：先确保两个前置插件就绪，再注册执行器、拉起连接池。"""
         self._panel.register(self.context)
         self._remote_config.register(self.context)
+        self._register_wakeup_route()
         await self._ensure_prerequisites()
         self._ensure_pool()
         self._ensure_queue()
         self._register_runner()
+        await self._hook.sync()
         logger.info("%s: 插件已启用（%s）", LOG_PREFIX, PLUGIN_VERSION)
 
     async def terminate(self) -> None:
@@ -314,7 +387,9 @@ class Plugin0528V2(Star):
         """
         self._panel.unregister(self.context)
         self._remote_config.unregister(self.context)
+        self._unregister_wakeup_route()
         self._unregister_runner()
+        await self._hook.stop()
         await self._shutdown_pool()
         # 队列里还排着的插话留在库里，下次启动捞回来接着处理（见 _ensure_queue）
         self._turn_queue = None
@@ -418,6 +493,84 @@ class Plugin0528V2(Star):
             self._panel_config(), self.plugin_config
         )
 
+    def _dashboard_base(self) -> str:
+        """AstrBot WebUI 的基地址（唤醒钩子复用它的端口）。"""
+        try:
+            config = self.context.get_config()
+        except Exception:  # noqa: BLE001 - 读不到就用默认端口
+            config = {}
+        dashboard = (
+            config.get("dashboard") if isinstance(config, Mapping) else None
+        )
+        dashboard = dashboard if isinstance(dashboard, Mapping) else {}
+        try:
+            port = int(dashboard.get("port") or 6185)
+        except (TypeError, ValueError):
+            port = 6185
+        host = str(dashboard.get("host") or "").strip()
+        if host in ("", "0.0.0.0", "::", "[::]"):
+            host = "127.0.0.1"
+        if ":" in host and not host.startswith("["):
+            host = f"[{host}]"
+        return f"http://{host}:{port}"
+
+    def _register_wakeup_route(self) -> None:
+        """把唤醒接口注册成 AstrBot 插件 Web API（复用 6185 端口）。"""
+        register = getattr(self.context, "register_web_api", None)
+        if not callable(register):
+            logger.debug(
+                "%s: 当前 context 不支持注册 Web API，跳过唤醒路由", LOG_PREFIX
+            )
+            return
+        route = f"/{PLUGIN_NAME}{wakeup_mod.HOOK_PATH}"
+        register(
+            route,
+            self._hook.handle_wakeup,
+            ["GET", "POST"],
+            "alkaid0 cron 唤醒钩子",
+        )
+        logger.info("%s: 唤醒钩子接口已注册 %s", LOG_PREFIX, route)
+
+    def _unregister_wakeup_route(self) -> None:
+        """插件停用时摘掉唤醒接口。"""
+        routes = getattr(self.context, "registered_web_apis", None)
+        if not isinstance(routes, list):
+            return
+        route = f"/{PLUGIN_NAME}{wakeup_mod.HOOK_PATH}"
+        routes[:] = [
+            item
+            for item in routes
+            if not (
+                isinstance(item, tuple)
+                and item
+                and str(item[0]) == route
+            )
+        ]
+
+    async def _drop_wakeup_api_keys(self) -> int:
+        """删除本插件自动申请的 AstrBot API Key（按固定名字）。"""
+        db = self.context.get_db()
+        removed = 0
+        for key in await db.list_api_keys():
+            if str(getattr(key, "name", "")) != wakeup_mod.ASTRBOT_KEY_NAME:
+                continue
+            if await db.delete_api_key(key.key_id):
+                removed += 1
+        return removed
+
+    async def _create_wakeup_api_key(self) -> str:
+        """申请（并替换）一个 ``plugin`` scope 的 AstrBot API Key，返回明文。"""
+        from astrbot.dashboard.services.api_key_service import ApiKeyService
+
+        db = self.context.get_db()
+        await self._drop_wakeup_api_keys()
+        service = ApiKeyService(db)
+        result = await service.create_api_key(
+            {"name": wakeup_mod.ASTRBOT_KEY_NAME, "scopes": ["plugin"]},
+            created_by=PLUGIN_NAME,
+        )
+        return str(result.get("api_key") or "")
+
     async def _after_panel_save(self, changed: dict[str, Any]) -> bool:
         """配置面板保存后的运行时刷新；返回是否需要重载插件才生效。
 
@@ -433,7 +586,173 @@ class Plugin0528V2(Star):
                 logger.warning(
                     "%s: 面板保存后同步空闲回收阈值失败：%s", LOG_PREFIX, exc
                 )
+
+        if any(key in changed for key in wakeup_mod.CONFIG_KEYS):
+            try:
+                await self._hook.sync()
+            except Exception as exc:  # noqa: BLE001 - 重启钩子失败不该让保存失败
+                logger.warning("%s: 面板保存后同步唤醒钩子失败：%s", LOG_PREFIX, exc)
+            install_keys = {
+                "wakeup_api_key",
+                "wakeup_public_url",
+                "wakeup_wait_sec",
+                "wakeup_auto_approve",
+            }
+            if self._hook_installed and (install_keys & set(changed)):
+                # 已经写进 alkaid0 的钩子命令里是旧地址 / 旧参数；不自动改 alkaid0，
+                # 只提醒用户回面板点一下「一键安装」。
+                self._hook_sync_note = "唤醒钩子设置已改，记得点一次「一键安装」"
         return any(key in panel_mod.RELOAD_KEYS for key in changed)
+
+    def _panel_hook_status(self) -> dict[str, Any]:
+        """面板要显示的钩子现状（随配置树下发）。"""
+        settings = self._hook.settings()
+        return {
+            "installed": self._hook_installed,
+            "note": self._hook_sync_note,
+            "endpoint": self._hook.endpoint() if settings.enabled else "",
+            "usable": settings.usable,
+        }
+
+    async def _panel_hook_status_async(self) -> dict[str, Any]:
+        """回读 alkaid0，返回真实的安装状态（远程配置页的一键按钮用）。"""
+        status = self._panel_hook_status()
+        try:
+            remote = await self._remote_config.get_cronjob_hook(
+                marker=self._hook.marker(),
+                env_names=(
+                    wakeup_mod.HOOK_ENV_KEY,
+                    wakeup_mod.HOOK_PLUGIN_ENV_KEY,
+                ),
+            )
+        except Exception as exc:  # noqa: BLE001 - alkaid0 没起来也能打开面板
+            status["error"] = str(exc)
+            return status
+        installed = bool(remote.get("installed"))
+        self._hook_installed = installed
+        status["installed"] = installed
+        status["endpoint"] = (
+            self._hook.endpoint() if self._hook.settings().enabled else ""
+        )
+        status["env"] = remote.get("env") or {}
+        if not self._hook_sync_note:
+            status["note"] = (
+                "已写入 alkaid0 的 OnCronjobWakeup"
+                if installed
+                else "还没写入"
+            )
+        return status
+
+    async def _panel_hook_action(self, action: str) -> dict[str, Any]:
+        """面板按钮：写入 / 移除 alkaid0 的 cron 唤醒钩子。"""
+        install = action == "install"
+        ok = await self._sync_alkaid0_hook(install=install)
+        return {
+            "ok": ok,
+            "installed": self._hook_installed,
+            "note": self._hook_sync_note,
+            "endpoint": self._hook.endpoint(),
+        }
+
+    async def _enable_wakeup(self) -> None:
+        """一键安装时顺便把唤醒开关打开并写盘（路由才会真正可用）。"""
+        try:
+            if self.plugin_config.get("wakeup_enable"):
+                return
+            self.plugin_config["wakeup_enable"] = True
+        except Exception as exc:  # noqa: BLE001 - 配置对象不可写就只记日志
+            logger.warning("%s: 自动启用唤醒钩子失败：%s", LOG_PREFIX, exc)
+            return
+        save = getattr(self.plugin_config, "save_config_async", None)
+        if callable(save):
+            try:
+                await save()
+            except Exception as exc:  # noqa: BLE001 - 开关已生效，保存失败只警告
+                logger.warning("%s: 保存唤醒开关失败：%s", LOG_PREFIX, exc)
+
+    async def _sync_alkaid0_hook(self, *, install: bool) -> bool:
+        """一键写入 / 移除 alkaid0 的 ``Hooks.OnCronjobWakeup``。
+
+        安装时自动在 AstrBot 里申请一个 ``plugin`` scope 的 API Key（名字固定，
+        先删同名旧 Key 再建），**明文直接写进钩子命令**的 ``X-API-Key`` 头；
+        插件自己的 ``wakeup_api_key``（如果配了）作为第二道口令，同样明文写进
+        命令。移除时把 Key 与钩子命令一起清掉；旧版本留在 ``Agent.TerminalEnvs``
+        里的变量顺带删除，用户自己的其它钩子原样保留。
+        """
+        settings = self._hook.settings()
+        if install and not settings.enabled:
+            await self._enable_wakeup()
+            settings = self._hook.settings()
+        if install and not settings.usable:
+            self._hook_sync_note = "未写入：先把「启用唤醒钩子」打开并保存"
+            logger.warning("%s: %s", LOG_PREFIX, self._hook_sync_note)
+            return False
+
+        # 旧版本把密钥放在 Agent.TerminalEnvs；现在密钥直接写进命令，
+        # 这里只保留「删除旧变量」的补丁（``None`` = 删除该键）。
+        env: dict[str, str | None] = {
+            wakeup_mod.HOOK_ENV_KEY: None,
+            wakeup_mod.HOOK_PLUGIN_ENV_KEY: None,
+        }
+        command: str | None = None
+        if install:
+            try:
+                raw_key = await self._create_wakeup_api_key()
+            except Exception as exc:  # noqa: BLE001 - 数据库 / 权限问题都要如实上报
+                self._hook_sync_note = f"申请 AstrBot API Key 失败：{exc}"
+                logger.warning("%s: %s", LOG_PREFIX, self._hook_sync_note)
+                return False
+            if not raw_key:
+                self._hook_sync_note = "申请 AstrBot API Key 失败：返回为空"
+                logger.warning("%s: %s", LOG_PREFIX, self._hook_sync_note)
+                return False
+            command = self._hook.command(settings, api_key=raw_key)
+        else:
+            try:
+                removed = await self._drop_wakeup_api_keys()
+                if removed:
+                    logger.info(
+                        "%s: 已撤销 %d 个唤醒用 AstrBot API Key",
+                        LOG_PREFIX,
+                        removed,
+                    )
+            except Exception as exc:  # noqa: BLE001 - 撤销失败不挡住移除钩子
+                logger.warning(
+                    "%s: 撤销唤醒用 AstrBot API Key 失败：%s", LOG_PREFIX, exc
+                )
+
+        try:
+            result = await self._remote_config.set_cronjob_hook(
+                command=command,
+                env=env,
+                marker=self._hook.marker(),
+            )
+        except Exception as exc:  # noqa: BLE001 - alkaid0 没起来 / 配置写不进去
+            self._hook_sync_note = f"同步失败：{exc}"
+            logger.warning("%s: %s", LOG_PREFIX, self._hook_sync_note)
+            return False
+
+        warning = str((result or {}).get("warning") or "")
+        self._hook_installed = install
+        self._hook_sync_note = f"已{'写入' if install else '移除'} alkaid0 的 OnCronjobWakeup" + (
+            "（回读失败，去远程配置里点一下重新读取）" if warning else ""
+        )
+        logger.info("%s: %s", LOG_PREFIX, self._hook_sync_note)
+        return True
+
+    async def _send_to_chat(self, unified_msg_origin: str, text: str) -> bool:
+        """主动往聊天里发一段文本（cron 回合转发用）。"""
+        if not text.strip():
+            return False
+        try:
+            chain = MessageChain().message(text)
+            sent = await self.context.send_message(unified_msg_origin, chain)
+        except Exception as exc:  # noqa: BLE001 - 平台不支持 / 会话失效都只记日志
+            logger.warning(
+                "%s: 主动发消息到 %s 失败：%s", LOG_PREFIX, unified_msg_origin, exc
+            )
+            return False
+        return bool(sent)
 
     def _cwd_for(
         self, key: str, event: AstrMessageEvent, settings: runner_mod.RunnerSettings
@@ -488,6 +807,14 @@ class Plugin0528V2(Star):
             with contextlib.suppress(Exception):
                 await client.close()
 
+    def _permission_handler(self, session: pool_mod.GroupSession) -> Any:
+        """给每条连接装审批处理函数（本地回合 / cron / 其它客户端共用）。"""
+        return runner_mod.build_permission_handler(
+            session,
+            label=session.key,
+            settings_provider=self._settings,
+        )
+
     def _ensure_pool(self) -> pool_mod.SessionPool:
         """创建连接池（含会话记录表）并启动空闲回收任务（幂等）。"""
         if self._pool is None:
@@ -497,6 +824,10 @@ class Plugin0528V2(Star):
                 idle_timeout=settings.idle_timeout_sec,
                 store=store,
             )
+            # 每条连接建好就装审批处理函数：外部回合没有 _run_gated，也要能直通。
+            self._pool.set_permission_handler_factory(self._permission_handler)
+            # 常驻监听：cron / 其它客户端发起的回合没有本地 prompt，也要把内容推回群聊
+            self._proactive.bind(self._pool)
             self._pool.start_reaper()
             logger.info(
                 "%s: ACP 连接池已启动（群空闲 %g 秒后回收连接；会话记录 %s，现有 %d 条）",
@@ -512,6 +843,7 @@ class Plugin0528V2(Star):
         pool, self._pool = self._pool, None
         if pool is None:
             return
+        await self._proactive.stop()
         await pool.stop_reaper()
         closed = await pool.close_all(reason="插件停用")
         logger.info("%s: 已断开 %d 条 ACP 连接", LOG_PREFIX, closed)
@@ -611,6 +943,27 @@ class Plugin0528V2(Star):
             f"执行器 {runner_mod.RUNNER_TYPE}: "
             f"{'已注册' if self._runner_registered else '未注册'}"
         )
+        auto = (
+            f"工具审批直通: {'开启' if settings.auto_approve_enable else '关闭'}"
+            f"；配置白名单 {settings.auto_approve_tools or '（空）'}"
+            f"；提示词 {'允许' if settings.auto_approve_prompt else '禁止'}"
+            f"；外部钩子 {'允许' if settings.auto_approve_hook else '禁止'}"
+        )
+        lines.append(auto)
+        lines.append(f"唤醒钩子（复用 AstrBot 端口）: {self._hook.status_line()}")
+        if self._hook.settings().enabled:
+            lines.append(f"  端点: {self._hook.endpoint()}")
+            lines.append(
+                "  alkaid0 cron 钩子: "
+                + (
+                    self._hook_sync_note
+                    or (
+                        "已写入（远程配置页可一键更新 / 移除）"
+                        if self._hook_installed
+                        else "未写入（远程配置页点「一键安装唤醒钩子」）"
+                    )
+                )
+            )
         lines.append(f"ACP 地址（面板值优先）: {mask_url(settings.url)}")
         lines.append(f"工作目录模板（面板值优先）: {settings.workspace_template}")
         queue = self._turn_queue
@@ -725,6 +1078,52 @@ class Plugin0528V2(Star):
         )
         yield event.plain_result("\n".join(lines))
 
+    # ------------------------------------------------------------ 强制回收（/aclean）
+    @filter.command("aclean")
+    async def clean_session(self, event: AstrMessageEvent):
+        """强制回收本群的 ACP 连接与会话（保留记录，下一条消息续接）。
+
+        与 ``/areset`` 不同：**不抹会话记录**，下次消息会 ``session/resume`` 回同一个
+        会话；与空闲回收不同的是它不看空闲计时、也不等在跑的那一轮结束 —— 直接
+        ``session/close`` 并断开连接，正在跑的一轮会因此报错收尾。
+        """
+        key = runner_mod.object_key(event)
+        pool = self._pool
+        if pool is None:
+            yield event.plain_result(
+                "连接池还没启动，检查一下插件是否加载成功（/0528v2）。"
+            )
+            return
+
+        session = pool.peek(key)
+        if session is None:
+            yield event.plain_result("本群当前没有活跃的 ACP 连接，不需要回收。")
+            return
+
+        session_id = session.session_id or "未建立"
+        busy = session.busy
+        # 先停掉主动推送的收集任务，避免回收后还把半截内容发到群里
+        self._proactive.cancel(key)
+        released = await pool.release(key, reason="用户执行 /aclean")
+        if not released:
+            yield event.plain_result("本群连接刚刚已经不在了，没有需要回收的。")
+            return
+
+        logger.info(
+            "%s: /aclean 强制回收群 %s（会话 %s，%s）",
+            LOG_PREFIX,
+            key,
+            session_id,
+            "当时正在跑一轮" if busy else "当时空闲",
+        )
+        lines = [
+            f"已强制回收本群的 ACP 连接（会话 {session_id}）。",
+            "会话记录保留，下一条消息会 session/resume 续接。",
+        ]
+        if busy:
+            lines.append("刚才正在跑的那一轮已被断开。")
+        yield event.plain_result("\n".join(lines))
+
     # ------------------------------------------------------------ 中止当前轮（/astop）
     @filter.command("astop")
     async def stop_turn(self, event: AstrMessageEvent):
@@ -823,15 +1222,7 @@ class Plugin0528V2(Star):
             return
 
         request_id, params = pending
-        option_id = ""
-        for option in params.get("options") or []:
-            if not isinstance(option, dict):
-                continue
-            if option.get("optionId") == acp_protocol.PERMISSION_OPTION_ALLOW_ONCE:
-                option_id = acp_protocol.PERMISSION_OPTION_ALLOW_ONCE
-                break
-            if not option_id and option.get("optionId"):
-                option_id = str(option["optionId"])
+        option_id = approval_mod.permission_option(params)
         if not option_id:
             yield event.plain_result(
                 "这条审批请求里没有可选的放行选项，没法批准（服务端没提供选项）。"
@@ -1235,3 +1626,106 @@ class Plugin0528V2(Star):
 
         logger.info("%s: /acmd 在群 %s 执行了 %s", LOG_PREFIX, key, text)
         yield event.plain_result(reply or f"{text} 执行完了，没有输出。")
+
+    # ------------------------------------------------------------ 定时任务（/acron）
+    @filter.command("acron")
+    async def cronjobs(self, event: AstrMessageEvent, arg: GreedyStr):
+        """列出本群会话的 Alkaid0 定时任务，或删除其中一条。
+
+        ``/acron`` 列出本群会话的任务（id / cron / 周期 / 下次触发 / 提示词摘要）；
+        ``/acron remove <id>`` 删除其中一条。``/acron all`` 已移除；创建 / 修改
+        任务仍由 alkaid0 的 ``cron`` 工具完成；命令权限交给 AstrBot 上层。
+        """
+        pool = self._pool
+        if pool is None:
+            yield event.plain_result(
+                "连接池还没启动，检查一下插件是否加载成功（/0528v2）。"
+            )
+            return
+
+        tokens = (arg or "").split()
+        action = tokens[0].lower() if tokens else ""
+        if not action:
+            job_list = await self._cronjobs_for_event(event, pool)
+            if isinstance(job_list, str):
+                yield event.plain_result(job_list)
+                return
+            yield event.plain_result(render_cron_jobs(job_list))
+            return
+        if action != "remove":
+            yield event.plain_result(
+                f"不认识的参数：{action}\n{CRON_COMMAND_HELP}"
+            )
+            return
+
+        async for chunk in self._remove_cronjob(event, pool, tokens):
+            yield chunk
+
+    async def _cronjobs_for_event(self, event: AstrMessageEvent, pool):
+        """读取本群会话的任务（列表 / 删除前确认）；出错时返回错误文本。"""
+        key = runner_mod.object_key(event)
+        settings = self._settings()
+        cwd = self._cwd_for(key, event, settings)
+        try:
+            session = await pool.acquire(
+                key,
+                url=settings.url,
+                cwd=cwd,
+                cwd_root=self._cwd_root(settings),
+            )
+        except Exception as exc:  # noqa: BLE001 - 连不上 / 开不了会话
+            logger.error("%s: /acron 打开群 %s 的会话失败：%s", LOG_PREFIX, key, exc)
+            return f"连不上 Alkaid0 或开不了会话：{exc}\n先看看 /0528v2。"
+        if not session.supports_cron:
+            return (
+                "Alkaid0 没有声明 cron 能力（alk.cxykevin.top/cron），"
+                "这个版本没法查询 / 删除定时任务。"
+            )
+        try:
+            return await session.cron_jobs()
+        except Exception as exc:  # noqa: BLE001 - 服务端报错 / 掉线
+            logger.warning("%s: /acron 读取群 %s 的任务失败：%s", LOG_PREFIX, key, exc)
+            return f"读取定时任务失败：{exc}"
+
+    async def _remove_cronjob(self, event: AstrMessageEvent, pool, tokens: list[str]):
+        """``/acron remove <id>``：删掉本群会话里的一条任务。"""
+        if len(tokens) != 2:
+            yield event.plain_result(
+                "用法：/acron remove <id>（id 从 Alkaid0 的定时任务列表里拿）"
+            )
+            return
+        job_id = parse_cron_job_id(tokens[1])
+        if job_id is None:
+            yield event.plain_result("任务 id 必须是正整数。")
+            return
+
+        job_list = await self._cronjobs_for_event(event, pool)
+        if isinstance(job_list, str):
+            yield event.plain_result(job_list)
+            return
+        key = runner_mod.object_key(event)
+        session = pool.peek(key)
+        if session is None:
+            yield event.plain_result("本群还没有活跃的 Alkaid0 会话。")
+            return
+        if not any(job.get("id") == job_id for job in job_list):
+            yield event.plain_result(
+                f"本群会话里没有 id 为 {job_id} 的定时任务。\n{CRON_COMMAND_HELP}"
+            )
+            return
+
+        try:
+            await session.delete_cron_job(job_id)
+        except Exception as exc:  # noqa: BLE001 - 任务没了 / 掉线都如实说
+            logger.warning(
+                "%s: /acron 删除群 %s 的任务 %s 失败：%s",
+                LOG_PREFIX,
+                key,
+                job_id,
+                exc,
+            )
+            yield event.plain_result(f"删除失败：{exc}")
+            return
+
+        logger.info("%s: /acron 已删除群 %s 的定时任务 %s", LOG_PREFIX, key, job_id)
+        yield event.plain_result(f"已删除本群会话的定时任务 {job_id}。")

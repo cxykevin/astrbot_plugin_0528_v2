@@ -462,6 +462,140 @@ class RemoteConfigService:
             "warning": warning,
         }
 
+    async def set_cronjob_hook(
+        self,
+        *,
+        command: str | None,
+        env: Mapping[str, str | None] | None = None,
+        marker: str = "",
+    ) -> dict[str, Any]:
+        """写入 / 移除 alkaid0 的 cron 唤醒钩子（``Hooks.OnCronjobWakeup``）。
+
+        alkaid0 的钩子配置是一个字符串数组，远程配置接口对数组是整体替换，所以
+        这里先读当前配置，**保留用户自己的钩子**，只把带 ``marker`` 的旧命令换掉，
+        然后再追加新命令（``command`` 为 ``None`` 时只做移除）。
+
+        Args:
+            command: 要写入的钩子命令；``None`` / 空串表示移除本插件的钩子。
+            env: 顺手写进 ``Agent.TerminalEnvs`` 的环境变量；值为 ``None`` 表示删除
+                该键。apikey 走这里，避免直接出现在命令行里。
+            marker: 用来认出「这条钩子是本插件写的」的固定子串（一般是带 tag 的
+                唤醒接口路径）。
+
+        Returns:
+            与其它保存接口一致的快照，额外带 ``hook`` 字段说明写入结果。
+        """
+        async with self._lock:
+            return await self._with_client(
+                lambda client: self._set_cronjob_hook_on(
+                    client, command, dict(env or {}), marker
+                )
+            )
+
+    async def _set_cronjob_hook_on(
+        self,
+        client: Any,
+        command: str | None,
+        env: Mapping[str, str | None],
+        marker: str,
+    ) -> dict[str, Any]:
+        current = await self._get_on(client)
+        hooks = current.get("Hooks")
+        hooks = hooks if isinstance(hooks, Mapping) else {}
+        raw = hooks.get("OnCronjobWakeup")
+        commands = [str(item) for item in raw] if isinstance(raw, list) else []
+        if marker:
+            commands = [item for item in commands if marker not in item]
+        if command:
+            commands.append(command)
+
+        patch: dict[str, Any] = {"Hooks": {"OnCronjobWakeup": commands}}
+        if env:
+            # 写完整的一份 TerminalEnvs（而不是只发增量）：
+            # 既兼容「null 表示删除」的 merge-patch，也兼容整体替换语义。
+            raw_env = (current.get("Agent") or {}).get("TerminalEnvs")
+            merged = (
+                {str(name): str(value) for name, value in raw_env.items()}
+                if isinstance(raw_env, Mapping)
+                else {}
+            )
+            for name, value in env.items():
+                if value is None:
+                    merged.pop(str(name), None)
+                else:
+                    merged[str(name)] = str(value)
+            patch["Agent"] = {"TerminalEnvs": merged}
+        validate_patch(patch, self.schema, current)
+        await client.call(
+            METHOD_CONFIG_SET, {"config": patch}, timeout=self.timeout
+        )
+
+        warning = ""
+        try:
+            fresh = await self._get_on(client)
+        except (RemoteConfigError, ACPError):
+            # 写入已经成功，只是回读失败（超时 / 掉线 / 返回结构不对）
+            fresh = current
+            warning = "refresh_failed"
+        logger.info(
+            "0528v2: 已%s alkaid0 的 cron 唤醒钩子（OnCronjobWakeup 现有 %d 条）",
+            "写入" if command else "移除",
+            len(commands),
+        )
+        return {
+            **self.snapshot(fresh),
+            "saved": flatten_patch(patch),
+            "warning": warning,
+            "hook": {
+                "installed": bool(command),
+                "commands": commands,
+                "command": command or "",
+            },
+        }
+
+    async def get_cronjob_hook(
+        self,
+        *,
+        marker: str,
+        env_names: tuple[str, ...] = (),
+    ) -> dict[str, Any]:
+        """只读：判断本插件的 cron 钩子 / 环境变量是否已在 alkaid0 里。
+
+        Args:
+            marker: 认出「本插件写的」钩子命令的固定子串。
+            env_names: 顺带检查这些 ``Agent.TerminalEnvs`` 键是否存在。
+
+        Returns:
+            ``{installed, command, commands, env}``；``env`` 只报键是否存在。
+        """
+        async with self._lock:
+            return await self._with_client(
+                lambda client: self._get_cronjob_hook_on(
+                    client, marker, tuple(env_names)
+                )
+            )
+
+    async def _get_cronjob_hook_on(
+        self,
+        client: Any,
+        marker: str,
+        env_names: tuple[str, ...],
+    ) -> dict[str, Any]:
+        current = await self._get_on(client)
+        hooks = current.get("Hooks")
+        hooks = hooks if isinstance(hooks, Mapping) else {}
+        raw = hooks.get("OnCronjobWakeup")
+        commands = [str(item) for item in raw] if isinstance(raw, list) else []
+        matched = [item for item in commands if marker and marker in item]
+        raw_env = (current.get("Agent") or {}).get("TerminalEnvs")
+        raw_env = raw_env if isinstance(raw_env, Mapping) else {}
+        return {
+            "installed": bool(matched),
+            "command": matched[0] if matched else "",
+            "commands": commands,
+            "env": {name: bool(raw_env.get(name)) for name in env_names},
+        }
+
     async def reload(self) -> dict[str, Any]:
         async with self._lock:
             return await self._with_client(self._reload_on)
