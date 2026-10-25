@@ -4368,8 +4368,11 @@ async def proactive_checks():
     settings = runner_mod.RunnerSettings.from_config(
         {"echo_events": True, "turn_timeout_sec": 5}, None
     )
+    proactive_gate = turn_queue_mod.TurnQueue()
     relay = proactive_mod.ProactiveRelay(
-        settings_provider=lambda: settings, send_text=send
+        settings_provider=lambda: settings,
+        send_text=send,
+        queue=proactive_gate,
     )
     created = []
 
@@ -4413,6 +4416,19 @@ async def proactive_checks():
     check(
         "即使空闲计时超时，主动回合进行中也不回收",
         await pool.reap_idle() == [] and session.connected,
+    )
+    check(
+        "主动回合占住了群内闸门（这期间用户消息会先排队）",
+        proactive_gate.busy("group:push"),
+    )
+    queued_user = asyncio.create_task(
+        proactive_gate.enter("group:push", "我也来了", speaker="小明")
+    )
+    await asyncio.sleep(0.01)
+    check(
+        "cron 回合期间用户消息在队列里等（不出去抢远端）",
+        proactive_gate.waiting("group:push") == 1,
+        str(proactive_gate.snapshot()),
     )
     client._broadcast(
         sid,
@@ -4473,6 +4489,16 @@ async def proactive_checks():
         relay._active == {} and session.proactive_active is False,
         f"{relay._active} / {session.proactive_active}",
     )
+    queued_slot = await queued_user
+    check(
+        "cron 回合结束：排队的用户消息攒批开跑（闸门交给它）",
+        queued_slot.action == turn_queue_mod.ACTION_MERGED
+        and queued_slot.text.endswith("[小明] 我也来了")
+        and proactive_gate.busy("group:push"),
+        queued_slot.text,
+    )
+    await proactive_gate.leave("group:push")
+    check("这批跑完，闸门空出来", not proactive_gate.busy("group:push"))
 
     # 本地回合（持会话锁）不能被主动推送重复收集
     sent.clear()
@@ -5264,6 +5290,41 @@ async def turn_queue_checks():
         (await later).action == turn_queue_mod.ACTION_MERGED,
     )
     await doomed.leave("group:e")
+
+    # ── 外部回合（cron）占门：用户消息先排队，结束后攒批接着跑 ──
+    held_gate = turn_queue_mod.TurnQueue()
+    check(
+        "外部回合能占住闸门",
+        held_gate.hold("group:h") is True and held_gate.busy("group:h"),
+    )
+    check(
+        "已经有轮次在跑时不再占门（不抢占别人的门）",
+        held_gate.hold("group:h") is False,
+    )
+    held_waiter = asyncio.create_task(
+        held_gate.enter("group:h", "我插一句", speaker="甲")
+    )
+    await asyncio.sleep(0.01)
+    check(
+        "cron 回合期间用户消息先排队（不立刻开跑）",
+        held_gate.waiting("group:h") == 1,
+        str(held_gate.snapshot()),
+    )
+    await held_gate.leave("group:h")
+    held_slot = await held_waiter
+    check(
+        "cron 回合结束后排队的用户消息攒批开跑",
+        held_slot.action == turn_queue_mod.ACTION_MERGED
+        and held_slot.text.startswith("（群里攒了 1 条消息，一起看一下）")
+        and held_slot.text.endswith("[甲] 我插一句"),
+        held_slot.text,
+    )
+    check(
+        "带队权交给排队的消息后，闸门仍由它占着",
+        held_gate.busy("group:h"),
+    )
+    await held_gate.leave("group:h")
+    check("这一批跑完，闸门空出来", not held_gate.busy("group:h"))
 
     # ── 坏库降级：读写失败只告警，队列照常 ──────────────
     broken = turn_queue_mod.TurnQueue(

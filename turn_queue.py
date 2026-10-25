@@ -155,6 +155,22 @@ class TurnQueue:
         """这个群当前是否有一轮在跑。"""
         return key in self._active
 
+    def hold(self, key: str) -> bool:
+        """外部回合（cron / 其它客户端）占住闸门：之后来的用户消息排队。
+
+        与 :meth:`enter` 的区别是「只占门、不排队、没有提示词」——外部回合的正文
+        由服务端推送，不走本地攒批。已经有一轮在跑时返回 ``False``（不抢占），
+        调用方此时也不该在结束时 :meth:`leave`，否则会把别人的门放开。
+
+        Returns:
+            是否真的占到了闸门。
+        """
+        if key in self._active:
+            return False
+        self._active.add(key)
+        logger.info("%s: 群 %s 由外部回合计时占用闸门（用户消息会先排队）", LOG_PREFIX, key)
+        return True
+
     def waiting(self, key: str) -> int:
         """这个群当前排着几条插话。"""
         return len(self._waiting.get(key, ()))

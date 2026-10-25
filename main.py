@@ -28,7 +28,7 @@
 from __future__ import annotations
 
 import contextlib
-from collections.abc import Mapping, MutableMapping
+from collections.abc import Mapping
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -826,8 +826,9 @@ class Plugin0528V2(Star):
             )
             # 每条连接建好就装审批处理函数：外部回合没有 _run_gated，也要能直通。
             self._pool.set_permission_handler_factory(self._permission_handler)
-            # 常驻监听：cron / 其它客户端发起的回合没有本地 prompt，也要把内容推回群聊
-            self._proactive.bind(self._pool)
+            # 常驻监听：cron / 其它客户端发起的回合没有本地 prompt，也要把内容推回群聊；
+            # 主动回合会占住群内闸门，让这期间用户发的消息先排队（cron 跑完再攒批接着跑）
+            self._proactive.bind(self._pool, self._ensure_queue())
             self._pool.start_reaper()
             logger.info(
                 "%s: ACP 连接池已启动（群空闲 %g 秒后回收连接；会话记录 %s，现有 %d 条）",

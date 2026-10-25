@@ -27,6 +27,7 @@ from . import agent_runner as runner_mod
 from .acp import approval as approval_mod
 from .acp import protocol as acp
 from .acp.pool import GroupSession, SessionPool
+from .turn_queue import TurnQueue
 
 #: 日志前缀。
 LOG_PREFIX = "0528v2"
@@ -156,6 +157,8 @@ class _ActiveTurn:
     session: GroupSession
     queue: asyncio.Queue = field(default_factory=asyncio.Queue)
     task: asyncio.Task | None = None
+    #: 是否占到了群内闸门（占到了才在结束时 ``leave``）。
+    holds_gate: bool = False
 
 
 class ProactiveRelay:
@@ -171,15 +174,25 @@ class ProactiveRelay:
         *,
         settings_provider: Callable[[], runner_mod.RunnerSettings],
         send_text: Callable[[str, str], Awaitable[bool]] | None = None,
+        queue: TurnQueue | None = None,
     ) -> None:
         self._settings_provider = settings_provider
         self._send_text = send_text
+        self._queue = queue
         self._pool: SessionPool | None = None
         self._active: dict[str, _ActiveTurn] = {}
 
     # ── 绑定 / 解绑 ───────────────────────────────────────
-    def bind(self, pool: SessionPool) -> None:
-        """接管连接池：给已有连接补挂监听，之后新建的连接自动挂。"""
+    def bind(self, pool: SessionPool, queue: TurnQueue | None = None) -> None:
+        """接管连接池：给已有连接补挂监听，之后新建的连接自动挂。
+
+        Args:
+            pool: 群连接池。
+            queue: 群内闸门；给了之后主动回合会占住它，让这期间的用户消息先排队
+                （``None`` 表示不占门：只要推送、不需要和本地回合串行时用）。
+        """
+        if queue is not None:
+            self._queue = queue
         self._pool = pool
         pool.set_session_listener(self.attach)
 
@@ -250,6 +263,10 @@ class ProactiveRelay:
 
         turn = _ActiveTurn(session=session)
         self._active[session.key] = turn
+        # 外部回合占住群内闸门：这期间用户发的消息先排队，等这一轮结束后再带着攒批跑。
+        # 占不到（已经有本地轮在跑）就不占 —— 不抢别人的门，结束时也就不该 leave。
+        if self._queue is not None:
+            turn.holds_gate = self._queue.hold(session.key)
         # 标记这一轮由主动推送接管：空闲回收任务据此跳过，别把连接从中间收走。
         session.proactive_active = True
         session.touch()
@@ -291,6 +308,9 @@ class ProactiveRelay:
                 del self._active[turn.session.key]
             turn.session.proactive_active = False
             turn.session.clear_external_grant()
+            if turn.holds_gate and self._queue is not None:
+                # 外部回合结束：把这期间排队的用户消息攒成一批交给下一个带队者。
+                await self._queue.leave(turn.session.key)
 
     async def _collect_and_send(self, turn: _ActiveTurn) -> None:
         """收集一轮主动回合，结束后把正文发到群聊。"""
