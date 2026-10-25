@@ -79,7 +79,7 @@
     },
     "plugin_wakeup": {
         "description": "允许主动唤醒 bot 的其它插件",
-        "type": "object",
+        "type": "dict",
         "default": {},
         "hint": "键是调用方插件名，值是系统提示词：可以只写一句话（当成 system_prompt），也可以写 {\"system_prompt\": \"...\", \"enabled\": true, \"reply_to_chat\": true}。系统提示词里的 {prompt} 会替换成插件这次传入的正文，没写就拼在正文前面。没配置的插件一律没有唤醒权限。调用方式见 README「给其它插件调用」。"
     },

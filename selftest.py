@@ -5415,6 +5415,21 @@ else:
 
 # --------------------------------------------------- 15. 仓库文件约束
 schema = json.loads((PLUGIN_DIR / "_conf_schema.json").read_text(encoding="utf-8"))
+#: 内核按 schema 构造默认配置时的真实解析（`object` 缺 `items` 会直接 KeyError，
+#: 然后整个插件加载失败 —— 真机上就是这么炸的，所以这条要真跑一遍）。
+try:
+    from astrbot.core.config.astrbot_config import AstrBotConfig
+
+    parsed_defaults = AstrBotConfig._config_schema_to_default_config(None, schema)
+    schema_error = None
+except Exception as exc:  # noqa: BLE001 - 解析失败即插件加载失败
+    parsed_defaults = {}
+    schema_error = exc
+check(
+    "schema 能被内核解析（自由映射要写 dict，object 必须带 items）",
+    schema_error is None and set(parsed_defaults) == set(schema),
+    repr(schema_error),
+)
 check(
     "配置 schema 提供全部配置项",
     set(schema)
