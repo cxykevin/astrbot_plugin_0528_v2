@@ -38,6 +38,8 @@ AstrBot 被 kill、机器断电之类的情况下内存队列会没掉，但记�
 from __future__ import annotations
 
 import asyncio
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 
 from astrbot.api import logger
@@ -149,6 +151,8 @@ class TurnQueue:
         self._active: set[str] = set()
         #: 群键 → 排着队的插话（按到达顺序）。
         self._waiting: dict[str, list[_Pending]] = {}
+        #: 群键 → 等「闸门空出来」的外部调用方（其它插件主动唤醒用）。
+        self._idle_waiters: dict[str, list[asyncio.Future]] = {}
 
     # ── 查询（状态命令 / 日志用）─────────────────────────
     def busy(self, key: str) -> bool:
@@ -279,43 +283,85 @@ class TurnQueue:
         """一轮结束：把攒下的插话合成一批交给下一个带队者，没人等就让闸门空出来。"""
         if key not in self._active:
             return
-        waiting = self._waiting.pop(key, None) or []
-        while (
-            waiting
-            and waiting[0].future is not None
-            and waiting[0].future.cancelled()
-        ):
-            # 等到一半被撤掉的（停用 / 超时）别带队，顺手把它那条记录也删了
-            self._forget([waiting.pop(0)])
-        if not waiting:
-            self._active.discard(key)
-            return
+        try:
+            waiting = self._waiting.pop(key, None) or []
+            while (
+                waiting
+                and waiting[0].future is not None
+                and waiting[0].future.cancelled()
+            ):
+                # 等到一半被撤掉的（停用 / 超时）别带队，顺手把它那条记录也删了
+                self._forget([waiting.pop(0)])
+            if not waiting:
+                self._active.discard(key)
+                return
 
-        leader = waiting[0]
-        if leader.future is None:
-            # 队首是恢复回来、没人接棒的孤儿：原样放回队列、闸门让出来，
-            # 等下一个消息来带队（记录先别删，下次启动还能再捞）
-            self._waiting.setdefault(key, []).extend(waiting)
-            self._active.discard(key)
-            return
+            leader = waiting[0]
+            if leader.future is None:
+                # 队首是恢复回来、没人接棒的孤儿：原样放回队列、闸门让出来，
+                # 等下一个消息来带队（记录先别删，下次启动还能再捞）
+                self._waiting.setdefault(key, []).extend(waiting)
+                self._active.discard(key)
+                return
 
-        self._forget(waiting)  # 这一批马上要发出去，别再当成「没处理的插话」
-        text = merge_prompt(waiting)
-        speakers = tuple(item.label for item in waiting if item.label)
-        if not leader.future.done():
-            leader.future.set_result(
-                TurnSlot(ACTION_MERGED, text, speakers, _senders(waiting))
+            self._forget(waiting)  # 这一批马上要发出去，别再当成「没处理的插话」
+            text = merge_prompt(waiting)
+            speakers = tuple(item.label for item in waiting if item.label)
+            if not leader.future.done():
+                leader.future.set_result(
+                    TurnSlot(ACTION_MERGED, text, speakers, _senders(waiting))
+                )
+            for item in waiting[1:]:
+                if item.future is not None and not item.future.done():
+                    item.future.set_result(TurnSlot(ACTION_ABSORBED))
+            logger.info(
+                "%s: 群 %s 上一轮结束，把 %d 条插话攒成一批接着跑（%s）",
+                LOG_PREFIX,
+                key,
+                len(waiting),
+                "、".join(speakers) or "匿名",
             )
-        for item in waiting[1:]:
-            if item.future is not None and not item.future.done():
-                item.future.set_result(TurnSlot(ACTION_ABSORBED))
-        logger.info(
-            "%s: 群 %s 上一轮结束，把 %d 条插话攒成一批接着跑（%s）",
-            LOG_PREFIX,
-            key,
-            len(waiting),
-            "、".join(speakers) or "匿名",
-        )
+        finally:
+            # 等闸门的外部调用方（其它插件主动唤醒）要重新抢：这一轮可能是直接
+            # 放门，也可能是交给攒批的带队者（那时它们醒来发现还忙，会继续等）。
+            self._wake_idle_waiters(key)
+
+    async def wait_idle(self, key: str) -> None:
+        """等这个群没有轮次在跑（外部调用方排队用）。
+
+        只等「闸门空出来」，不进攒批队列、也不改提示词；醒来后由调用方自己再
+        :meth:`hold`，抢不到就继续等（先到先得，不保证严格 FIFO）。
+        """
+        while key in self._active:
+            future = asyncio.get_running_loop().create_future()
+            self._idle_waiters.setdefault(key, []).append(future)
+            try:
+                await future
+            finally:
+                waiters = self._idle_waiters.get(key)
+                if waiters is not None and future in waiters:
+                    waiters.remove(future)
+                    if not waiters:
+                        self._idle_waiters.pop(key, None)
+
+    @asynccontextmanager
+    async def external(self, key: str) -> AsyncIterator[None]:
+        """外部调用方占住闸门：忙就等，跑完再放（其它插件主动唤醒用）。
+
+        与 :meth:`enter` 的区别：不进攒批队列、不改提示词，只保证同一个群不并发。
+        """
+        while not self.hold(key):
+            await self.wait_idle(key)
+        try:
+            yield
+        finally:
+            await self.leave(key)
+
+    def _wake_idle_waiters(self, key: str) -> None:
+        """叫醒等闸门的外部调用方（让它们重新抢门）。"""
+        for future in self._idle_waiters.pop(key, []):
+            if not future.done():
+                future.set_result(None)
 
     # ── 内部 ─────────────────────────────────────────────
     async def _wait(

@@ -3,7 +3,7 @@
 > AstrBot ↔ **Alkaid0 Coding Agent** 中继插件：把 AstrBot 的「Agent 执行器」接到 alkaid0 上，
 > 走 **ACP（Agent Client Protocol）v2 over WebSocket**。
 
-当前版本（v0.3.0）做了这些事：
+当前版本（v0.4.0）做了这些事：
 
 1. **注册执行器**：启动时用前置插件 librunner 注册名为 `alkaid0` 的执行器 ——
    在 WebUI「AI → Agent 执行方式」里选中它，群消息就交给 alkaid0 处理；
@@ -75,6 +75,12 @@
 17. **`/aclean` 强制回收**：不等空闲计时、也不等在跑的那一轮 —— 直接
     `session/close` 并断开本群连接；**保留会话记录**，下一条消息照常 `session/resume`
     续接（与抹记录、重开会话的 `/areset` 不同）。
+18. **给其它插件调用**：其它 AstrBot 插件可以
+    `from data.plugins.astrbot_plugin_0528_v2.api import wake`，调
+    `wake(plugin, session, prompt)` 让 alkaid0 在指定会话里主动跑一轮 —— 回复默认发到群里，
+    同时把正文返回给调用方。**谁能唤、带什么系统提示词**由 `plugin_wakeup` 配置按插件
+    逐个指定（没配置的插件一律拒绝）；唤醒与普通消息 / cron 共用群内闸门，群里正在跑时
+    先排队，不会两轮并发。
 
 > [!NOTE]
 > 这一版的功能已经比较完整：ACP 传输（连接 / 握手 / 会话 / 提示词 / 通知 / 工具审批）、
@@ -158,6 +164,8 @@ libi18nject  ←  librunner  ←  astrbot_plugin_0528_v2
 ```
 astrbot_plugin_0528_v2/
 ├── main.py            插件主体：前置检查 + 注册执行器 + 连接池生命周期 + `/0528v2` `/actx` `/areset` `/aclean` `/astop` `/aapprove` `/amodel` `/aeffort` `/aresume` `/aworkdir` `/acmd` `/acron`
+├── api.py             给其它 AstrBot 插件的唤醒接口：`wake(plugin, session, prompt)` + 进程级共享登记
+├── plugin_wakeup.py   「插件唤醒」配置解析：谁能唤 / 系统提示词 / 回复是否发到群
 ├── agent_runner.py    Alkaid0Runner（一轮对话 → 一次 ACP prompt turn）+ `run_slash_command`（一轮命令）
 ├── proactive.py       常驻监听：把 cron / 其它客户端发起的回合（没有本地 prompt）主动推回群聊
 ├── wakeup_hook.py     HTTP 唤醒钩子：cron 唤醒时续接会话、等送达并转发回复；一键写入 alkaid0 钩子
@@ -207,6 +215,7 @@ astrbot_plugin_0528_v2/
 | `auto_approve_tools` | 字符串 | 空 | 自动批准的工具白名单（逗号 / 空格分隔，大小写不敏感，支持 `*` / `?`；单独 `*` 表示全部） |
 | `auto_approve_prompt` | bool | `true` | 是否允许本轮消息里的 `[auto_approve: read, edit]` 临时授权（只对本轮生效，标记会从提示词删掉） |
 | `auto_approve_hook` | bool | `true` | 是否允许 `/wakeup` 等外部入口按请求参数临时授权（只对这次外部回合生效） |
+| `plugin_wakeup` | object | `{}` | 允许主动唤醒 bot 的**其它插件**：`{插件名: 系统提示词}`，或 `{插件名: {system_prompt, enabled, reply_to_chat}}`。没列出的插件一律没有权限；系统提示词里的 `{prompt}` 会替换成调用方传入的正文，不写就拼在前面。属于复杂类型，在**原生配置页**编辑（按插件逐个配） |
 | `wakeup_enable` | bool | `false` | 启用唤醒钩子接口：复用 AstrBot 自己的 Web 端口，路径 `/<插件名>/wakeup`（供 alkaid0 的 cron 钩子调用） |
 | `wakeup_api_key` | 字符串 | 空 | 可选第二道口令：请求头 `X-0528V2-Key` 或查询参数 `?plugin_key=`（AstrBot 自己的 API Key 鉴权仍由框架负责）；写进 alkaid0 钩子命令时以明文 `X-0528V2-Key` 头发送 |
 | `wakeup_public_url` | 字符串 | 空 | alkaid0 访问唤醒钩子用的对外地址（AstrBot 的基地址，如 `https://bot.example`）；留空按 AstrBot 面板地址推导 |
@@ -255,6 +264,47 @@ astrbot_plugin_0528_v2/
 
 ---
 
+## 给其它插件调用
+
+其它 AstrBot 插件可以主动让 bot 在某个会话里跑一轮（巡检、定时汇总、由业务插件触发的工作流）：
+
+```python
+from data.plugins.astrbot_plugin_0528_v2.api import wake
+
+result = await wake(
+    "astrbot_plugin_myplugin",       # 调用方插件名（必须写进 plugin_wakeup）
+    "aiocqhttp:group:123456",        # 目标会话：AstrBot 的 unified_msg_origin
+    "看看今天的日志有没有报错",       # 这次要做的事（可空，只用系统提示词）
+)
+# result.ok / result.text / result.error / result.session_id / result.cwd / result.sent
+```
+
+先在**插件配置 → `plugin_wakeup`**（复杂类型，在原生配置页编辑）里给调用方授权并指定系统提示词：
+
+```json
+{
+  "astrbot_plugin_myplugin": "你是巡检助手，只回答巡检相关的问题",
+  "astrbot_plugin_report": {
+    "system_prompt": "你是日报助手，按要点输出。用户补充：{prompt}",
+    "enabled": true,
+    "reply_to_chat": true
+  }
+}
+```
+
+- 键是调用方插件名（`metadata.yaml` 里的 `name`），值是系统提示词或对象；
+- 没列出的插件一律拒绝（`ok=False`，什么都不执行）；
+- 系统提示词里的 `{prompt}` 替换成这次传入的正文；不写就拼在正文前面；
+- `reply_to_chat` 默认 `true`：回复**同时**发到群里并返回给调用方；按次传 `send=False` 可只取结果；
+- 可以按次传 `cwd` / `timeout` 覆盖（默认用本群的工作目录与 `turn_timeout_sec`）；
+- 唤醒与普通消息 / cron 共用群内闸门：群里正在跑一轮时先排队（不进攒批队列、也不改提示词），
+  跑完再发；不会两轮并发写同一个会话。
+
+`api.service_ready()` 可以先判断本插件是否已启动；没启动时 `wake()` 抛 `WakeError`。
+`/0528v2` 的「插件唤醒」一行会列出当前授权了哪些插件。
+
+---
+
 ## 开发环境
 
 在 AstrBot 仓库根目录（`/path/to/AstrBot`）用该实例的 uv 环境执行：
@@ -276,7 +326,8 @@ astrbot_plugin_0528_v2/
 # 配置面板（字段树 / 类型校验 / 凭证脱敏与还原 / 保存回滚 / 路由注册 / i18n 完整性）、
 # alkaid0 全局配置（config/get|set|reload / 嵌套 patch 脱敏与还原 / 未知字段兼容 /
 # 远程服务与路由 / 树视图静态资源 / i18n 标题区分）、
-# /aworkdir 各分支、执行器注册/注销、状态文本、schema 一致性
+# /aworkdir 各分支、执行器注册/注销、状态文本、schema 一致性、
+# 插件唤醒（配置解析 / 系统提示词 / 未授权拒绝 / 占门排队 / API 登记与注销）
 uv run python data/plugins/astrbot_plugin_0528_v2/selftest.py
 
 # 代码检查（selftest.py 里若干 E402 是刻意的 import 顺序，其余文件应零告警）
@@ -377,6 +428,10 @@ uv run ruff check data/plugins/astrbot_plugin_0528_v2/
   本轮提示词标记 / 外部钩子授权才能自动放行；命中后直接回 `allow_once`，但仍不主动拒绝。
   **提示词标记只对本轮有效、会在发送前删掉**；外部钩子授权只对本次 cron 回合有效并按 TTL 过期。
   还没批准时连接被回收 / 插件停用，挂起记录随连接一起丢（服务端那边会按超时处理）；
+- **其它插件唤醒要显式授权**：`plugin_wakeup` 是 `object` 类型（在原生配置页编辑），没列出的
+  插件一律拒绝；系统提示词只做拼接 / `{prompt}` 替换，**不会**改 alkaid0 的全局 system prompt；
+  回复默认发到群里（`send=False` 只返回给调用方）。唤醒期间占着该群的闸门，对调用方是
+  **阻塞等待**（最长 `turn_timeout_sec`）；期间群里其他人的消息排队，不会被这一轮吞掉；
 - **配置面板只编辑标量字段**：`_conf_schema.json` 里的 `bool` / `string` / `int` /
   `float` / `text` 会出现在面板里；`list` / `object` / `template_list` 等复杂类型仍走
   原生配置页。ACP 地址 / 仓库地址里的凭证显示为 `***`，保存时按字段名还原；

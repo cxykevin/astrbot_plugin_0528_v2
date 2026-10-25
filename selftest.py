@@ -66,7 +66,9 @@ if "ASTRBOT_ROOT" not in os.environ:
     os.environ["ASTRBOT_ROOT"] = tempfile.mkdtemp(prefix="0528v2-selftest-")
 
 from data.plugins.astrbot_plugin_0528_v2 import agent_runner as runner_mod
+from data.plugins.astrbot_plugin_0528_v2 import api as wake_api
 from data.plugins.astrbot_plugin_0528_v2 import main as own_main
+from data.plugins.astrbot_plugin_0528_v2 import plugin_wakeup as plugin_wakeup_mod
 from data.plugins.astrbot_plugin_0528_v2 import panel as panel_mod
 from data.plugins.astrbot_plugin_0528_v2 import prerequisite as prereq_mod
 from data.plugins.astrbot_plugin_0528_v2 import proactive as proactive_mod
@@ -5009,6 +5011,365 @@ async def wakeup_checks():
 
 asyncio.run(wakeup_checks())
 
+
+# --------------------------------------------------- 13d. 其它插件主动唤醒（plugin_wakeup + api）
+async def plugin_wakeup_checks():
+    """配置解析 / 系统提示词 / 未授权拒绝 / 占门排队 / API 登记与转发。"""
+    profiles = plugin_wakeup_mod.parse_profiles(
+        {
+            "plugin_a": "你是巡检助手",
+            "plugin_b": {
+                "system_prompt": "客服：{prompt}",
+                "reply_to_chat": False,
+            },
+            "plugin_off": {"enabled": False},
+            "plugin_empty": {},
+            "plugin_bad": 42,
+            "  ": "空名字",
+        }
+    )
+    check(
+        "插件唤醒：简写字符串 = 只有系统提示词，坏条目跳过",
+        set(profiles) == {"plugin_a", "plugin_b", "plugin_off", "plugin_empty"}
+        and profiles["plugin_a"].system_prompt == "你是巡检助手"
+        and profiles["plugin_a"].enabled
+        and profiles["plugin_a"].reply_to_chat
+        and profiles["plugin_b"].reply_to_chat is False
+        and profiles["plugin_off"].enabled is False,
+        str(profiles),
+    )
+    check(
+        "插件唤醒：非法配置整体当空（配置写错不炸）",
+        plugin_wakeup_mod.parse_profiles(None) == {}
+        and plugin_wakeup_mod.parse_profiles("oops") == {}
+        and plugin_wakeup_mod.parse_profiles([]) == {},
+    )
+    check(
+        "插件唤醒：系统提示词拼装（{prompt} 替换 / 前后拼接 / 空）",
+        plugin_wakeup_mod.build_prompt(profiles["plugin_a"], "看看日志")
+        == "你是巡检助手\n\n看看日志"
+        and plugin_wakeup_mod.build_prompt(profiles["plugin_b"], "退款")
+        == "客服：退款"
+        and plugin_wakeup_mod.build_prompt(profiles["plugin_a"], "")
+        == "你是巡检助手"
+        and plugin_wakeup_mod.build_prompt(
+            plugin_wakeup_mod.PluginProfile("x"), "只有正文"
+        )
+        == "只有正文"
+        and plugin_wakeup_mod.build_prompt(
+            plugin_wakeup_mod.PluginProfile("x"), ""
+        )
+        == "",
+    )
+    check(
+        "插件唤醒：状态摘要列出启用 / 停用",
+        plugin_wakeup_mod.describe_profiles({})
+        == "未配置（其它插件不能唤醒 bot）"
+        and "plugin_a（启用，你是巡检助手）"
+        in plugin_wakeup_mod.describe_profiles(profiles)
+        and "plugin_off（停用" in plugin_wakeup_mod.describe_profiles(profiles),
+    )
+
+    # ── API 登记：没启动时抛错、登记后转发、旧实例注销不抹新实例 ──
+    wake_api.unregister_service()
+    check("插件唤醒：没启动时 service_ready 为假", wake_api.service_ready() is False)
+    not_ready = None
+    try:
+        await wake_api.wake("plugin_a", "group:x")
+    except wake_api.WakeError as exc:
+        not_ready = str(exc)
+    check(
+        "插件唤醒：没启动时 wake 抛 WakeError（不静默失败）",
+        bool(not_ready and "还没启动" in not_ready),
+        str(not_ready),
+    )
+    bad_name = None
+    try:
+        await wake_api.wake("", "group:x")
+    except wake_api.WakeError as exc:
+        bad_name = str(exc)
+    check(
+        "插件唤醒：插件名为空时抛 WakeError",
+        bool(bad_name and "plugin" in bad_name),
+        str(bad_name),
+    )
+
+    forwarded = []
+    fake_result = wake_api.WakeResult(ok=True, text="好")
+
+    class _FakeWakeService:
+        async def wake_for_plugin(self, plugin, umo, prompt, **kwargs):
+            forwarded.append((plugin, umo, prompt, kwargs))
+            return fake_result
+
+    first_service = _FakeWakeService()
+    wake_api.register_service(first_service)
+    called = await wake_api.wake("plugin_a", "group:x", "看看", send=False, timeout=3)
+    check(
+        "插件唤醒：wake 把参数原样转给服务",
+        wake_api.service_ready()
+        and called is fake_result
+        and forwarded
+        == [
+            (
+                "plugin_a",
+                "group:x",
+                "看看",
+                {"cwd": None, "timeout": 3, "send": False},
+            )
+        ],
+        str(forwarded),
+    )
+    second_service = _FakeWakeService()
+    wake_api.register_service(second_service)
+    wake_api.unregister_service(first_service)
+    check(
+        "插件唤醒：旧实例注销不会抹掉新实例的登记",
+        wake_api.service_ready() is True,
+    )
+    wake_api.unregister_service(second_service)
+    check("插件唤醒：注销后不再就绪", wake_api.service_ready() is False)
+
+    # ── 真插件：未授权 / 授权 / 系统提示词 / 发到群 ──
+    sent = []
+
+    async def send(key, text):
+        sent.append((key, text))
+        return True
+
+    created = []
+
+    def factory(url, name):
+        client = FakeClient(
+            url,
+            name,
+            updates=[
+                {
+                    "sessionUpdate": "agent_message_chunk",
+                    "messageId": "m",
+                    "content": {"type": "text", "text": "巡检完成"},
+                },
+                {
+                    "sessionUpdate": "state_update",
+                    "state": "idle",
+                    "stopReason": "end_turn",
+                },
+            ],
+        )
+        created.append(client)
+        return client
+
+    plugin = Plugin0528V2(
+        context=None,
+        config={
+            "enforce_prerequisite": False,
+            "acp_url": "ws://acp",
+            "workspace_template": "/w/{groupid}",
+            "plugin_wakeup": {
+                "plugin_a": "你是巡检助手",
+                "plugin_b": {
+                    "system_prompt": "客服：{prompt}",
+                    "reply_to_chat": False,
+                },
+                "plugin_off": {"enabled": False},
+                "plugin_empty": {},
+            },
+        },
+    )
+    plugin._pool = pool_mod.SessionPool(client_factory=factory, idle_timeout=300)
+    plugin._send_to_chat = send
+    key = "aiocqhttp:group:901"
+    result = await plugin.wake_for_plugin("plugin_a", key, "看看日志")
+    prompts = [
+        call[1]["text"] for call in created[0].calls if call[0] == "session/prompt"
+    ]
+    check(
+        "插件唤醒：授权插件能唤醒，系统提示词拼在正文前",
+        result.ok and prompts == ["你是巡检助手\n\n看看日志"],
+        f"{result} / {prompts}",
+    )
+    check(
+        "插件唤醒：回复默认发到群里并返回给调用方",
+        result.text == "巡检完成"
+        and sent == [(key, "巡检完成")]
+        and result.sent is True,
+        f"{result} / {sent}",
+    )
+    check(
+        "插件唤醒：cwd 按模板渲染（没有真实消息事件也能算）",
+        result.cwd == "/w/901",
+        result.cwd,
+    )
+    status_text = plugin._render_status()
+    check(
+        "插件唤醒：状态文本列出授权插件",
+        "插件唤醒: " in status_text and "plugin_a（启用" in status_text,
+        status_text,
+    )
+
+    sent.clear()
+    denied = await plugin.wake_for_plugin("nobody", key, "黑一个")
+    check(
+        "插件唤醒：没授权的插件被拒绝且不执行",
+        denied.ok is False
+        and "没有唤醒权限" in denied.error
+        and sent == []
+        and len(created) == 1,
+        f"{denied} / {len(created)}",
+    )
+    disabled = await plugin.wake_for_plugin("plugin_off", key, "停用的")
+    check(
+        "插件唤醒：enabled=false 的插件同样拒绝",
+        disabled.ok is False and "没有唤醒权限" in disabled.error,
+        str(disabled),
+    )
+    empty_prompt = await plugin.wake_for_plugin("plugin_empty", key, "  ")
+    check(
+        "插件唤醒：没系统提示词又没正文时拒绝（不发空 prompt）",
+        empty_prompt.ok is False and "提示词为空" in empty_prompt.error,
+        str(empty_prompt),
+    )
+
+    sent.clear()
+    quiet = await plugin.wake_for_plugin("plugin_b", key, "退款")
+    quiet_prompts = [
+        call[1]["text"] for call in created[0].calls if call[0] == "session/prompt"
+    ]
+    check(
+        "插件唤醒：{prompt} 替换生效；reply_to_chat=false 只返回不发群",
+        quiet.ok
+        and quiet_prompts[-1] == "客服：退款"
+        and sent == []
+        and quiet.sent is False,
+        f"{quiet_prompts[-1]} / {sent} / {quiet}",
+    )
+    sent.clear()
+    forced = await plugin.wake_for_plugin("plugin_b", key, "退款", send=True)
+    check(
+        "插件唤醒：调用方可以按次覆盖 send（强制发到群）",
+        forced.ok and forced.sent is True and sent == [(key, "巡检完成")],
+        f"{forced} / {sent}",
+    )
+
+    # ── 占门排队：唤醒期间用户消息排队，结束后攒批接着跑 ──
+    class SlowWakeClient(FakeClient):
+        """提示词发出去后卡住，等测试放行才回 idle。"""
+
+        def __init__(self, url, name):
+            super().__init__(url, name)
+            self.release = asyncio.Event()
+
+        async def session_prompt(self, session_id, text, timeout=None):
+            self.calls.append(
+                ("session/prompt", {"sessionId": session_id, "text": text})
+            )
+            await self.release.wait()
+            self._broadcast(
+                session_id,
+                {
+                    "sessionUpdate": "agent_message_chunk",
+                    "messageId": "slow",
+                    "content": {"type": "text", "text": "慢回复"},
+                },
+            )
+            self._broadcast(
+                session_id,
+                {"sessionUpdate": "state_update", "state": "idle", "stopReason": "end_turn"},
+            )
+            return {}
+
+    slow_created = []
+
+    def slow_factory(url, name):
+        client = SlowWakeClient(url, name)
+        slow_created.append(client)
+        return client
+
+    slow_plugin = Plugin0528V2(
+        context=None,
+        config={
+            "enforce_prerequisite": False,
+            "acp_url": "ws://acp",
+            "workspace_template": "/w/{groupid}",
+            "plugin_wakeup": {"plugin_a": "慢一点"},
+        },
+    )
+    slow_plugin._pool = pool_mod.SessionPool(
+        client_factory=slow_factory, idle_timeout=300
+    )
+    slow_plugin._send_to_chat = send
+    slow_key = "aiocqhttp:group:902"
+    sent.clear()
+    slow_task = asyncio.create_task(
+        slow_plugin.wake_for_plugin("plugin_a", slow_key, "跑个慢任务")
+    )
+    await asyncio.sleep(0.05)
+    check(
+        "插件唤醒：唤醒期间占住群内闸门",
+        slow_plugin._ensure_queue().busy(slow_key),
+    )
+    queued_user = asyncio.create_task(
+        slow_plugin._ensure_queue().enter(slow_key, "用户插话", speaker="小明")
+    )
+    await asyncio.sleep(0.01)
+    check(
+        "插件唤醒：期间用户消息先排队（不抢远端）",
+        slow_plugin._ensure_queue().waiting(slow_key) == 1,
+        str(slow_plugin._ensure_queue().snapshot()),
+    )
+    slow_created[0].release.set()
+    slow_result = await slow_task
+    queued_slot = await queued_user
+    check(
+        "插件唤醒：结束后排队的用户消息攒批开跑（闸门交给它）",
+        slow_result.ok
+        and queued_slot.action == turn_queue_mod.ACTION_MERGED
+        and queued_slot.text.endswith("[小明] 用户插话"),
+        f"{slow_result} / {queued_slot.text}",
+    )
+    await slow_plugin._ensure_queue().leave(slow_key)
+    check(
+        "插件唤醒：这一批跑完闸门空出来",
+        not slow_plugin._ensure_queue().busy(slow_key),
+    )
+
+    # ── 失败路径：连不上 / 服务端报错都返回 ok=False ──
+    sent.clear()
+    down_plugin = Plugin0528V2(
+        context=None,
+        config={
+            "enforce_prerequisite": False,
+            "acp_url": "ws://acp",
+            "workspace_template": "/w/{groupid}",
+            "plugin_wakeup": {"plugin_a": "x"},
+        },
+    )
+    down_plugin._pool = pool_mod.SessionPool(
+        client_factory=lambda url, name: FakeClient(url, name, fail_connect=True),
+        idle_timeout=300,
+    )
+    down_plugin._send_to_chat = send
+    down = await down_plugin.wake_for_plugin(
+        "plugin_a", "aiocqhttp:group:903", "在吗"
+    )
+    check(
+        "插件唤醒：连不上时返回 ok=False 并说明原因",
+        down.ok is False and "连不上" in down.error,
+        str(down),
+    )
+    check(
+        "插件唤醒：连不上时不会发空消息到群里",
+        sent == [],
+        str(sent),
+    )
+
+    await plugin._shutdown_pool()
+    await slow_plugin._shutdown_pool()
+    await down_plugin._shutdown_pool()
+
+
+asyncio.run(plugin_wakeup_checks())
+
 # --------------------------------------------------- 14. 执行器注册（librunner 在场时）
 try:
     from data.plugins.astrbot_plugin_librunner.api import (
@@ -5071,6 +5432,7 @@ check(
         "auto_approve_tools",
         "auto_approve_prompt",
         "auto_approve_hook",
+        "plugin_wakeup",
         "wakeup_enable",
         "wakeup_api_key",
         "wakeup_public_url",

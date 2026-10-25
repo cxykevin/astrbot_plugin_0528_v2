@@ -40,7 +40,9 @@ from astrbot.core.message.message_event_result import MessageChain
 from astrbot.core.star.filter.command import GreedyStr
 
 from . import agent_runner as runner_mod
+from . import api as wake_api
 from . import panel as panel_mod
+from . import plugin_wakeup as plugin_wakeup_mod
 from . import prerequisite as prerequisite_mod
 from . import proactive as proactive_mod
 from . import remote_config as remote_config_mod
@@ -57,7 +59,7 @@ from .turn_queue import TurnQueue
 PLUGIN_NAME = "astrbot_plugin_0528_v2"
 
 #: 插件版本（与 metadata.yaml 的 version 保持一致）。
-PLUGIN_VERSION = "v0.3.0"
+PLUGIN_VERSION = "v0.4.0"
 
 #: 日志前缀。
 LOG_PREFIX = prerequisite_mod.LOG_PREFIX
@@ -277,6 +279,31 @@ def parse_cron_job_id(token: str) -> int | None:
     return value if value > 0 else None
 
 
+class _UmoEvent:
+    """只提供工作目录模板需要的三个取值（其它插件唤醒时没有真实消息事件）。
+
+    ``unified_msg_origin`` 形如 ``aiocqhttp:group:123456``：第二段是消息类型，
+    第三段是会话号（群里是群号，私聊是用户号）——和 :func:`agent_runner.render_workspace`
+    的取法一致。
+    """
+
+    def __init__(self, umo: str) -> None:
+        self.unified_msg_origin = umo
+        parts = (umo or "").split(":", 2)
+        self._platform = parts[0] if parts else ""
+        self._kind = parts[1] if len(parts) > 1 else ""
+        self._session_id = parts[2] if len(parts) > 2 else ""
+
+    def get_platform_name(self) -> str:
+        return self._platform
+
+    def get_group_id(self) -> str:
+        return self._session_id if self._kind == "group" else ""
+
+    def get_session_id(self) -> str:
+        return self._session_id
+
+
 def _one_line(text: object, limit: int = 60) -> str:
     """把多行文本压成一行并截断（任务提示词可能很长）。"""
     raw = " ".join(str(text or "").split())
@@ -376,6 +403,8 @@ class Plugin0528V2(Star):
         self._ensure_pool()
         self._ensure_queue()
         self._register_runner()
+        # 让其它插件能 ``from ... .api import wake``：登记本实例（热重载会覆盖）
+        wake_api.register_service(self)
         await self._hook.sync()
         logger.info("%s: 插件已启用（%s）", LOG_PREFIX, PLUGIN_VERSION)
 
@@ -385,6 +414,7 @@ class Plugin0528V2(Star):
         顺序不能反：执行器注册与连接都是「业务」，要在前置（librunner / libi18nject）
         还在的时候撤销；随后再逆序释放前置实例。
         """
+        wake_api.unregister_service(self)
         self._panel.unregister(self.context)
         self._remote_config.unregister(self.context)
         self._unregister_wakeup_route()
@@ -754,6 +784,121 @@ class Plugin0528V2(Star):
             return False
         return bool(sent)
 
+    # ------------------------------------------------------ 其它插件主动唤醒
+    async def wake_for_plugin(
+        self,
+        plugin: str,
+        umo: str,
+        prompt: str = "",
+        *,
+        cwd: str | None = None,
+        timeout: float | None = None,
+        send: bool | None = None,
+    ) -> wake_api.WakeResult:
+        """其它插件主动唤醒：在 ``umo`` 里跑一轮，把回复返回（可选发到群里）。
+
+        授权与系统提示词来自 ``plugin_wakeup`` 配置（见 :mod:`plugin_wakeup`）：
+        没配的插件直接拒绝，什么都不会执行。唤醒和普通消息 / cron 共用群内闸门，
+        群里正在跑一轮时先排队（不进攒批队列、也不改提示词），跑完再发。
+        """
+        profiles = plugin_wakeup_mod.parse_profiles(
+            self.plugin_config.get(plugin_wakeup_mod.CONFIG_KEY)
+        )
+        profile = profiles.get(plugin)
+        if profile is None or not profile.enabled:
+            logger.warning(
+                "%s: 插件 %s 没有唤醒权限（plugin_wakeup 里没配或已停用）",
+                LOG_PREFIX,
+                plugin,
+            )
+            return wake_api.WakeResult(
+                ok=False,
+                error=f"插件 {plugin} 没有唤醒权限：在「插件唤醒」配置里为它加一条",
+            )
+
+        text = plugin_wakeup_mod.build_prompt(profile, prompt)
+        if not text:
+            return wake_api.WakeResult(
+                ok=False, error="提示词为空（系统提示词和这次的内容都没写）"
+            )
+
+        pool = self._pool
+        if pool is None:
+            return wake_api.WakeResult(
+                ok=False, error="连接池还没启动，检查一下插件是否加载成功（/0528v2）"
+            )
+
+        settings = self._settings()
+        target_cwd = (cwd or "").strip() or runner_mod.resolve_cwd(
+            settings.workspace_template,
+            self._ensure_store().get_workdir(umo),
+            _UmoEvent(umo),
+        )
+        wait = float(timeout) if timeout and float(timeout) > 0 else float(
+            settings.turn_timeout_sec
+        )
+        to_chat = profile.reply_to_chat if send is None else bool(send)
+        logger.info(
+            "%s: 插件 %s 唤醒群 %s（系统提示词 %d 字，正文 %d 字，发到群=%s）",
+            LOG_PREFIX,
+            plugin,
+            umo,
+            len(profile.system_prompt),
+            len((prompt or "").strip()),
+            to_chat,
+        )
+
+        async with self._ensure_queue().external(umo):
+            try:
+                session = await pool.acquire(
+                    umo,
+                    url=settings.url,
+                    cwd=target_cwd,
+                    cwd_root=self._cwd_root(settings),
+                )
+            except Exception as exc:  # noqa: BLE001 - 连不上 / 开不了会话都如实回报
+                logger.error(
+                    "%s: 插件 %s 打开群 %s 的会话失败：%s", LOG_PREFIX, plugin, umo, exc
+                )
+                return wake_api.WakeResult(
+                    ok=False,
+                    error=f"连不上 Alkaid0 或开不了会话：{exc}",
+                    cwd=target_cwd,
+                )
+
+            try:
+                reply = await runner_mod.run_slash_command(
+                    session, text, timeout=wait, echo_events=False
+                )
+            except Exception as exc:  # noqa: BLE001 - 超时 / 断线 / 服务端报错
+                logger.warning(
+                    "%s: 插件 %s 唤醒群 %s 失败：%s", LOG_PREFIX, plugin, umo, exc
+                )
+                return wake_api.WakeResult(
+                    ok=False,
+                    error=str(exc) or exc.__class__.__name__,
+                    session_id=session.session_id or "",
+                    cwd=target_cwd,
+                )
+
+            reply = (reply or "").strip()
+            sent = bool(reply) and to_chat and await self._send_to_chat(umo, reply)
+            logger.info(
+                "%s: 插件 %s 唤醒群 %s 完成（%d 字，发送=%s）",
+                LOG_PREFIX,
+                plugin,
+                umo,
+                len(reply),
+                sent,
+            )
+            return wake_api.WakeResult(
+                ok=True,
+                text=reply,
+                session_id=session.session_id or "",
+                cwd=target_cwd,
+                sent=sent,
+            )
+
     def _cwd_for(
         self, key: str, event: AstrMessageEvent, settings: runner_mod.RunnerSettings
     ) -> str:
@@ -951,6 +1096,10 @@ class Plugin0528V2(Star):
             f"；外部钩子 {'允许' if settings.auto_approve_hook else '禁止'}"
         )
         lines.append(auto)
+        profiles = plugin_wakeup_mod.parse_profiles(
+            self.plugin_config.get(plugin_wakeup_mod.CONFIG_KEY)
+        )
+        lines.append(f"插件唤醒: {plugin_wakeup_mod.describe_profiles(profiles)}")
         lines.append(f"唤醒钩子（复用 AstrBot 端口）: {self._hook.status_line()}")
         if self._hook.settings().enabled:
             lines.append(f"  端点: {self._hook.endpoint()}")

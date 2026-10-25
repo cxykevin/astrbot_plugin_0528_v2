@@ -57,6 +57,10 @@
       "description": "Allow external hook grants",
       "hint": "When enabled, /wakeup and other external entry points may pass auto_approve (true or a tool list) to approve only that external turn. The master switch still applies."
     },
+  "plugin_wakeup": {
+    "description": "Other plugins allowed to wake the bot",
+    "hint": "Key = caller plugin name, value = system prompt: either a plain string or an object (system_prompt / enabled / reply_to_chat); {prompt} is replaced by the caller's text. Plugins not listed here cannot wake the bot."
+  },
     "wakeup_enable": {
       "description": "Enable the HTTP wake-up hook (cronjob)",
       "hint": "The wake-up endpoint reuses AstrBot's own Web port (/api/v1/plugins/extensions/astrbot_plugin_0528_v2/wakeup); no extra port is opened. It accepts a session ID, resumes every conversation bound to that session and only answers once the connections have actually received this turn's updates. A one-click install turns this switch on."

@@ -57,6 +57,10 @@
       "description": "允许外部钩子临时授权",
       "hint": "开启后，/wakeup 等外部入口可在请求里带 auto_approve（true 或工具名列表），只对这次外部回合放行；仍受总开关限制。以执行器面板为准。"
     },
+  "plugin_wakeup": {
+    "description": "允许主动唤醒 bot 的其它插件",
+    "hint": "键是调用方插件名，值是系统提示词：可以只写一句话，也可以写对象（system_prompt / enabled / reply_to_chat）；{prompt} 会替换成调用方传入的正文。没配置的插件不能唤醒。"
+  },
     "wakeup_enable": {
       "description": "启用 HTTP 唤醒钩子（cronjob）",
       "hint": "唤醒接口直接复用 AstrBot 自己的 Web 端口（/api/v1/plugins/extensions/astrbot_plugin_0528_v2/wakeup），不再另开端口。开启后，alkaid0 的 cron 唤醒钩子传入会话 ID，就把所有绑定这个会话的群续接上（session/resume），等它们真的收到这一轮的消息再返回。一键安装会自动打开这个开关。"
