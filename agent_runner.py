@@ -34,6 +34,7 @@ from astrbot.core.astr_agent_context import AstrAgentContext
 from astrbot.core.message.message_event_result import MessageChain
 from astrbot.core.provider.entities import LLMResponse, ProviderRequest
 
+from . import meme_bridge
 from .acp import ACPConnectionError, ACPError, GroupSession, SessionPool
 from .acp import approval as approval_mod
 from .acp import protocol as acp
@@ -924,6 +925,8 @@ class Alkaid0Runner(BaseAgentRunner[AstrAgentContext]):
             只在内存里排队的（不落库）。
         settings_provider: 读 AstrBot ``provider_settings`` 的函数（注入提示前缀 /
             用户识别 / 群名）；不传就用 :func:`read_provider_settings`，自测时可注入假配置。
+        context: 本插件的 AstrBot ``Context``，用来找同装的插件（目前只用于
+            「表情包管理器」联动）；不传就退到 ``run_context.context.context``。
     """
 
     def __init__(
@@ -932,11 +935,13 @@ class Alkaid0Runner(BaseAgentRunner[AstrAgentContext]):
         plugin_config: Mapping | None = None,
         turn_queue: TurnQueue | None = None,
         settings_provider: T.Callable[[], Mapping] | None = None,
+        context: T.Any = None,
     ) -> None:
         self._pool = pool
         self._plugin_config: dict = dict(plugin_config or {})
         self._turn_queue = turn_queue if turn_queue is not None else TurnQueue()
         self._settings_provider = settings_provider or read_provider_settings
+        self._context = context
         self._settings = RunnerSettings.from_config(None, self._plugin_config)
 
         self.request: ProviderRequest | None = None
@@ -1065,6 +1070,18 @@ class Alkaid0Runner(BaseAgentRunner[AstrAgentContext]):
             return None
         return getattr(context, "event", None)
 
+    def _plugin_context(self) -> T.Any:
+        """本插件的 AstrBot ``Context``（找同装插件用，目前只有表情包联动）。
+
+        优先用构造时传进来的那份；没传就顺着 ``run_context`` 往上找 ——
+        ``AstrAgentContext`` 上挂着插件 ``Context``（``.context``）。自测里用的
+        假上下文没有这一层，取不到就是 ``None``（等于「没装任何联动插件」）。
+        """
+        if self._context is not None:
+            return self._context
+        agent_context = getattr(self.run_context, "context", None)
+        return getattr(agent_context, "context", None)
+
     def _cwd_for(self, key: str, event: T.Any) -> str:
         """这个群这一轮用的工作目录：绑过 ``/aworkdir`` 就用绑定，否则按模板渲染。"""
         store = getattr(self._pool, "store", None)
@@ -1117,7 +1134,7 @@ class Alkaid0Runner(BaseAgentRunner[AstrAgentContext]):
 
         try:
             async with session.lock:
-                async for response in self._run_turn(session, prompt_text):
+                async for response in self._run_turn(session, prompt_text, event):
                     yield response
         except Exception as exc:  # noqa: BLE001 - 执行期问题同样上报
             logger.error(
@@ -1145,11 +1162,18 @@ class Alkaid0Runner(BaseAgentRunner[AstrAgentContext]):
         await self._announce_done()
 
     async def _run_turn(
-        self, session: GroupSession, prompt_text: str
+        self, session: GroupSession, prompt_text: str, event: T.Any
     ) -> AsyncGenerator[AgentResponse, None]:
-        """提交提示词并消费通知，直到本轮 ``state_update idle``。"""
+        """提交提示词并消费通知，直到本轮 ``state_update idle``。
+
+        表情包管理器（``meme_manager``）装了并启用着时，这一轮的正文会先交给它处理：
+        流式增量里先把 ``&&分类键&&`` 挡掉，收尾时再用它返回的干净正文和选好的图片
+        拼回复（见 :mod:`meme_bridge`）。
+        """
         settings = self._settings
         queue: asyncio.Queue[tuple[str, dict]] = asyncio.Queue()
+        #: 表情包联动（没装 / 没启用时为 ``None``，整条路径不生效）
+        meme = meme_bridge.bridge_for(self._plugin_context(), event)
 
         def _on_notification(method: str, params: dict) -> None:
             queue.put_nowait((method, params))
@@ -1244,10 +1268,16 @@ class Alkaid0Runner(BaseAgentRunner[AstrAgentContext]):
                         message_id, text, replace=(kind == acp.UPDATE_AGENT_MESSAGE)
                     )
                     if kind == acp.UPDATE_AGENT_MESSAGE_CHUNK and self.streaming:
-                        yield AgentResponse(
-                            type="streaming_delta",
-                            data=AgentResponseData(chain=MessageChain().message(text)),
-                        )
+                        # 表情包标记边收边挡：群里只看到正文，标记交给 meme_manager。
+                        # 整消息 upsert 不走增量（同一段正文会被重复发一次）。
+                        visible = meme.filter_delta(text) if meme is not None else text
+                        if visible:
+                            yield AgentResponse(
+                                type="streaming_delta",
+                                data=AgentResponseData(
+                                    chain=MessageChain().message(visible)
+                                ),
+                            )
                 elif kind in (acp.UPDATE_AGENT_THOUGHT_CHUNK, acp.UPDATE_AGENT_THOUGHT):
                     text = acp.extract_text(update.get("content"))
                     if not text:
@@ -1339,6 +1369,20 @@ class Alkaid0Runner(BaseAgentRunner[AstrAgentContext]):
             # 消息，所以不受 echo_events 开关影响。
             transcript.add_progress("🛑 本轮已终止")
 
+        if meme is not None:
+            # 流式收尾：清理器可能还压着半截文本（正好停在 ``&&`` 中间，或者它的
+            # 解析器按行缓冲），这一轮已经结束，把剩下的吐出去。
+            tail = meme.flush()
+            if tail:
+                logger.debug(
+                    "%s: 群 %s 流式正文补发尾巴 %d 字", LOG_PREFIX, session.key, len(tail)
+                )
+                if self.streaming:
+                    yield AgentResponse(
+                        type="streaming_delta",
+                        data=AgentResponseData(chain=MessageChain().message(tail)),
+                    )
+
         body = transcript.text()
         rendered = transcript.render()
         thought = "".join(thoughts[mid] for mid in thought_order).strip()
@@ -1361,8 +1405,20 @@ class Alkaid0Runner(BaseAgentRunner[AstrAgentContext]):
         chain = MessageChain()
         if thought and settings.show_thought:
             chain = MessageChain(type="reasoning").message(thought)
-        if rendered:
-            chain.message(rendered)
+
+        # 表情包标记由本插件自己解析：正文减掉 ``&&分类键&&`` 就是回复（原样发，
+        # 不经过 meme_manager 的清洗规则），分类键直接交给它的底层接口取图。
+        reply_text = rendered
+        prepared: dict | None = None
+        if meme is not None and rendered:
+            reply_text, tags = meme.parse(rendered)
+            if tags:
+                prepared = await meme.build(tags)
+        if reply_text:
+            chain.message(reply_text)
+
+        if prepared is not None:
+            await self._deliver_memes(meme, prepared, has_text=bool(reply_text))
 
         self.final_llm_resp = LLMResponse(role="assistant", result_chain=chain)
         self._transition_state(AgentState.DONE)
@@ -1375,6 +1431,20 @@ class Alkaid0Runner(BaseAgentRunner[AstrAgentContext]):
             len(rendered),
         )
         yield AgentResponse(type="llm_result", data=AgentResponseData(chain=chain))
+
+    async def _deliver_memes(
+        self, meme: T.Any, prepared: dict, *, has_text: bool
+    ) -> None:
+        """把表情包管理器选好的图片送出去。
+
+        真流式时正文已经边收边发了，这一轮不会再有正文消息，图片只能自己发；纯表情
+        回复同理（内核那边是空消息链，挂起的图没人触发）。其余情况交给它的
+        ``after_message_sent``，图片跟在正文后面单独发出，临时文件也由它清理。
+        """
+        if not prepared.get("images"):
+            return
+        if self.streaming or not has_text or not meme.defer_images(prepared):
+            await meme.send_images(prepared)
 
     async def _fail(self, text: str) -> AsyncGenerator[AgentResponse, None]:
         """统一的失败路径：标记出错、记下最终结果、推一个 ``err`` 响应。"""

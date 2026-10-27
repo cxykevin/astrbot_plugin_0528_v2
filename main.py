@@ -59,7 +59,7 @@ from .turn_queue import TurnQueue
 PLUGIN_NAME = "astrbot_plugin_0528_v2"
 
 #: 插件版本（与 metadata.yaml 的 version 保持一致）。
-PLUGIN_VERSION = "v0.4.0"
+PLUGIN_VERSION = "v0.4.1"
 
 #: 日志前缀。
 LOG_PREFIX = prerequisite_mod.LOG_PREFIX
@@ -1015,7 +1015,10 @@ class Plugin0528V2(Star):
             register_runner(
                 runner_mod.RUNNER_TYPE,
                 factory=lambda: runner_mod.Alkaid0Runner(
-                    self._ensure_pool(), self.plugin_config, self._ensure_queue()
+                    self._ensure_pool(),
+                    self.plugin_config,
+                    self._ensure_queue(),
+                    context=self.context,
                 ),
                 config_default=dict(runner_mod.RUNNER_CONFIG_DEFAULT),
                 config_metadata=dict(runner_mod.RUNNER_CONFIG_METADATA),

@@ -68,8 +68,9 @@ if "ASTRBOT_ROOT" not in os.environ:
 from data.plugins.astrbot_plugin_0528_v2 import agent_runner as runner_mod
 from data.plugins.astrbot_plugin_0528_v2 import api as wake_api
 from data.plugins.astrbot_plugin_0528_v2 import main as own_main
-from data.plugins.astrbot_plugin_0528_v2 import plugin_wakeup as plugin_wakeup_mod
+from data.plugins.astrbot_plugin_0528_v2 import meme_bridge as meme_bridge_mod
 from data.plugins.astrbot_plugin_0528_v2 import panel as panel_mod
+from data.plugins.astrbot_plugin_0528_v2 import plugin_wakeup as plugin_wakeup_mod
 from data.plugins.astrbot_plugin_0528_v2 import prerequisite as prereq_mod
 from data.plugins.astrbot_plugin_0528_v2 import proactive as proactive_mod
 from data.plugins.astrbot_plugin_0528_v2 import remote_config as remote_mod
@@ -721,6 +722,20 @@ class FakeEvent:
         self.unified_msg_origin = (
             umo or f"{platform}:group:{session_id or group_id or 'default'}"
         )
+        #: 事件上的附加数据（表情包联动会往这里挂待发图片）
+        self.extras = {}
+        #: 直接发出去的消息链（`event.send` 的记录）
+        self.sent = []
+
+    def get_extra(self, key, default=None):
+        return self.extras.get(key, default)
+
+    def set_extra(self, key, value):
+        self.extras[key] = value
+
+    async def send(self, chain):
+        """记录发出去的消息链（表情包联动测试用）。"""
+        self.sent.append(chain)
 
     def get_group_id(self):
         return self._group_id
@@ -6611,6 +6626,421 @@ async def panel_checks():
         own_main.mask_url("ws://h/acp?key=x") == "ws://h/acp?key=***",
     )
 
+
+# --------------------------------------------------- 表情包管理器联动（meme_manager）
+def _meme_chain(text):
+    """自测用：造一条只含纯文本的消息链（局部导入，不动文件头的导入顺序）。"""
+    from astrbot.core.message.message_event_result import MessageChain
+
+    return MessageChain().message(text) if text else MessageChain([])
+
+
+class FakeStarRegistry:
+    """假的插件注册表：只回答 ``get_registered_star``。"""
+
+    def __init__(self, meta=None):
+        self.meta = meta
+        self.asked = []
+
+    def get_registered_star(self, name):
+        self.asked.append(name)
+        return self.meta if name == "meme_manager" else None
+
+
+class FakeMemePlugin:
+    """假的表情包管理器：只实现联动用到的那三个底层方法。"""
+
+    def __init__(
+        self,
+        *,
+        after_sent=True,
+        categories=("happy", "sad"),
+        fail_lookup=False,
+        convert=False,
+    ):
+        self.categories = set(categories)
+        self.requested = []  # 取过图的分类（按请求顺序）
+        self.converted = []  # 走过 GIF 转换的路径
+        self.sent_images = []  # 真正发出去的图片路径
+        self.fail_lookup = fail_lookup
+        #: 模拟它的 ``convert_static_to_gif``：关着就原样返回路径（和真插件一样）
+        self.convert = convert
+        if after_sent:
+            #: 它自己的 after_message_sent 钩子（``defer_images`` 会探测这个）
+            self._after_message_sent_impl = lambda event: None
+
+    def _get_category_meme_files(self, event, category):
+        if self.fail_lookup:
+            raise RuntimeError("boom")
+        self.requested.append(category)
+        if category not in self.categories:
+            return []
+        return [Path(f"/tmp/meme/{category}/a.png")]
+
+    def _convert_to_gif(self, path):
+        self.converted.append(path)
+        if not self.convert:
+            return path
+        fd, temp_path = tempfile.mkstemp(prefix="meme_", suffix=".gif")
+        os.close(fd)
+        return temp_path
+
+    async def _send_meme_image(self, event, image):
+        self.sent_images.append(str(image.path))
+        await event.send(_meme_chain("IMG"))
+
+
+def _meme_meta(plugin, *, activated=True):
+    return SimpleNamespace(activated=activated, star_cls=plugin)
+
+
+async def meme_bridge_checks():
+    """表情包管理器联动：判定口径、标记解析、取图与发送。"""
+
+    # 1. 「装了并启用着」的判定
+    check("表情包联动：没有 Context 时不生效", meme_bridge_mod.find_plugin(None) is None)
+    check(
+        "表情包联动：插件没装时不生效",
+        meme_bridge_mod.find_plugin(FakeStarRegistry()) is None,
+    )
+    plugin = FakeMemePlugin()
+    check(
+        "表情包联动：插件停用时视同没装",
+        meme_bridge_mod.find_plugin(FakeStarRegistry(_meme_meta(plugin, activated=False)))
+        is None,
+    )
+    old_plugin = SimpleNamespace(compat_prepare_message=lambda *a: None)
+    check(
+        "表情包联动：缺底层接口的版本不联动",
+        meme_bridge_mod.find_plugin(FakeStarRegistry(_meme_meta(old_plugin))) is None,
+    )
+    registry = FakeStarRegistry(_meme_meta(plugin))
+    check(
+        "表情包联动：装好并启用时拿到插件实例",
+        meme_bridge_mod.find_plugin(registry) is plugin
+        and registry.asked == [meme_bridge_mod.MEME_PLUGIN_NAME],
+        str(registry.asked),
+    )
+
+    # 2. 标记解析（本插件自己的实现，规则即「原生分类标签」）
+    cleaned, tags = meme_bridge_mod.parse_markers("你好，&&happy&&今天真好 &&sad&&")
+    check(
+        "标记解析：正文只减掉标记，分类按出现顺序",
+        cleaned == "你好，今天真好" and tags == ["happy", "sad"],
+        f"{cleaned!r} {tags}",
+    )
+    cleaned, tags = meme_bridge_mod.parse_markers("&&happy&&&&happy&&")
+    check(
+        "标记解析：同一分类只取一次",
+        cleaned == "" and tags == ["happy"],
+        f"{cleaned!r} {tags}",
+    )
+    cleaned, tags = meme_bridge_mod.parse_markers("&&a&b&&（括号和代码不动）")
+    check(
+        "标记解析：只管 &&…&&，别的一律不动",
+        cleaned == "&&a&b&&（括号和代码不动）" and tags == [],
+        f"{cleaned!r} {tags}",
+    )
+    check(
+        "has_marker 只认完整标记",
+        meme_bridge_mod.has_marker("哈 &&happy&&")
+        and not meme_bridge_mod.has_marker("哈 &happy&")
+        and not meme_bridge_mod.has_marker(""),
+    )
+
+    # 3. 流式清理器（同一套规则，增量到达时挡掉）
+    marker_filter = meme_bridge_mod.MarkerFilter()
+    check(
+        "标记清理：整段一次到齐",
+        marker_filter.feed("你好 &&happy&&！") == "你好 ！",
+    )
+    marker_filter = meme_bridge_mod.MarkerFilter()
+    pieces = [
+        marker_filter.feed("你好 &&hap"),
+        marker_filter.feed("py&& 呀"),
+        marker_filter.finish(),
+    ]
+    check(
+        "标记清理：跨增量也能接上",
+        "".join(pieces) == "你好  呀",
+        repr(pieces),
+    )
+    marker_filter = meme_bridge_mod.MarkerFilter()
+    check(
+        "标记清理：结尾单个 & 先压着不急着发",
+        marker_filter.feed("a&") == "a"
+        and marker_filter.feed("&") == ""
+        and marker_filter.finish() == "&&",
+    )
+    marker_filter = meme_bridge_mod.MarkerFilter()
+    check(
+        "标记清理：没收尾的 && 原样吐回来",
+        marker_filter.feed("&&unclosed") == ""
+        and marker_filter.finish() == "&&unclosed",
+    )
+    marker_filter = meme_bridge_mod.MarkerFilter()
+    long_body = "x" * (meme_bridge_mod.MarkerFilter.MAX_BODY + 1)
+    check(
+        "标记清理：超长候选不算标记",
+        marker_filter.feed(f"&&{long_body}&&") + marker_filter.finish()
+        == f"&&{long_body}&&",
+    )
+    marker_filter = meme_bridge_mod.MarkerFilter()
+    check(
+        "标记清理：正文里带 & 的片段不算标记",
+        marker_filter.feed("&&a&b&&") + marker_filter.finish() == "&&a&b&&",
+    )
+
+    # 4. 取图与发送（只用它的底层方法）
+    event = FakeEvent(group_id="570", session_id="570")
+    bridge = meme_bridge_mod.bridge_for(registry, event)
+    check("表情包联动：bridge_for 拿到交棒器", isinstance(bridge, meme_bridge_mod.MemeBridge))
+    prepared = await bridge.build(["happy", "missing", "sad"])
+    check(
+        "取图：分类键直接当目录名交给它（不查它的分类配置）",
+        plugin.requested == ["happy", "missing", "sad"]
+        and [Path(image.path).parent.name for image in prepared["images"]]
+        == ["happy", "sad"],
+        f"{plugin.requested} / {prepared}",
+    )
+    check(
+        "取图：静态图交给它的 _convert_to_gif",
+        plugin.converted == ["/tmp/meme/happy/a.png", "/tmp/meme/sad/a.png"],
+        str(plugin.converted),
+    )
+    # 转换开 / 关：它只在「静态图转 GIF」打开时才真转（关着原样返回路径）
+    off_plugin = FakeMemePlugin()
+    off_bridge = meme_bridge_mod.bridge_for(
+        FakeStarRegistry(_meme_meta(off_plugin)), event
+    )
+    off_prepared = await off_bridge.build(["happy"])
+    check(
+        "取图：它没开静态图转 GIF 时用原图、不产生临时文件",
+        off_prepared["temp_files"] == []
+        and off_prepared["images"][0].path == "/tmp/meme/happy/a.png",
+        str(off_prepared),
+    )
+    on_plugin = FakeMemePlugin(convert=True)
+    on_bridge = meme_bridge_mod.bridge_for(FakeStarRegistry(_meme_meta(on_plugin)), event)
+    on_prepared = await on_bridge.build(["happy"])
+    temp_gif = (on_prepared["temp_files"] or [""])[0]
+    check(
+        "取图：它开了转换时记下临时 GIF",
+        len(on_prepared["temp_files"]) == 1
+        and on_prepared["images"][0].path == temp_gif
+        and os.path.exists(temp_gif),
+        str(on_prepared["temp_files"]),
+    )
+    await on_bridge.send_images(on_prepared)
+    check(
+        "发图后清掉转换出来的临时 GIF",
+        on_plugin.sent_images == [temp_gif] and not os.path.exists(temp_gif),
+        f"{on_plugin.sent_images} / {os.path.exists(temp_gif)}",
+    )
+
+    check(
+        "非流式：图片挂给它的 after_message_sent",
+        bridge.defer_images(prepared) is True
+        and event.get_extra("meme_manager_pending_images") == prepared["images"],
+        str(event.extras),
+    )
+    no_hook = meme_bridge_mod.bridge_for(
+        FakeStarRegistry(_meme_meta(FakeMemePlugin(after_sent=False))), event
+    )
+    check(
+        "表情包联动：对方没有 after_message_sent 时改自己发",
+        no_hook.defer_images({"images": [object()]}) is False,
+    )
+    boom = meme_bridge_mod.bridge_for(
+        FakeStarRegistry(_meme_meta(FakeMemePlugin(fail_lookup=True))), event
+    )
+    check("取图：某个分类报错时按没有图处理", await boom.build(["happy"]) is None)
+    empty = meme_bridge_mod.bridge_for(
+        FakeStarRegistry(_meme_meta(FakeMemePlugin(categories=()))), event
+    )
+    check("取图：分类下没有图片就不发", await empty.build(["happy"]) is None)
+    check(
+        "表情包联动：没有事件时不建桥",
+        meme_bridge_mod.bridge_for(registry, None) is None,
+    )
+
+    # 5. Runner 端到端（流式：标记不外泄、正文原样、图片自己发）
+    stream_updates = [
+        {
+            "sessionUpdate": "agent_message_chunk",
+            "messageId": "m1",
+            "content": {"type": "text", "text": "你好，"},
+        },
+        {
+            "sessionUpdate": "agent_message_chunk",
+            "messageId": "m1",
+            "content": {"type": "text", "text": "&&hap"},
+        },
+        {
+            "sessionUpdate": "agent_message_chunk",
+            "messageId": "m1",
+            "content": {"type": "text", "text": "py&&今天真好"},
+        },
+        {"sessionUpdate": "state_update", "state": "idle", "stopReason": "end_turn"},
+    ]
+    stream_plugin = FakeMemePlugin()
+
+    def stream_factory(url, name):
+        return FakeClient(url, name, updates=list(stream_updates))
+
+    stream_pool = pool_mod.SessionPool(client_factory=stream_factory, idle_timeout=300)
+    stream_runner = runner_mod.Alkaid0Runner(
+        stream_pool,
+        {"acp_url": "ws://plugin/acp"},
+        context=FakeStarRegistry(_meme_meta(stream_plugin)),
+    )
+    stream_event = FakeEvent(group_id="571", session_id="571")
+    await stream_runner.reset(
+        request=SimpleNamespace(prompt="在吗"),
+        run_context=SimpleNamespace(context=SimpleNamespace(event=stream_event)),
+        agent_hooks=None,
+        streaming=True,
+    )
+    responses = [response async for response in stream_runner.step_until_done()]
+    deltas = [_chain_text(response.data["chain"]) for response in responses[:-1]]
+    stream_final = _chain_text(responses[-1].data["chain"])
+    check(
+        "流式联动：群里看不到表情标记",
+        "".join(deltas) == "你好，今天真好" and "&&" not in "".join(deltas),
+        repr(deltas),
+    )
+    check(
+        "流式联动：回复就是去掉标记的正文",
+        stream_final == "你好，今天真好",
+        stream_final,
+    )
+    check(
+        "流式联动：图片由管理器底层接口发（正文已经在流里）",
+        stream_plugin.sent_images == ["/tmp/meme/happy/a.png"]
+        and stream_plugin.requested == ["happy"]
+        and not stream_event.get_extra("meme_manager_pending_images"),
+        f"{stream_plugin.sent_images} / {stream_plugin.requested}",
+    )
+    await stream_runner.close()
+    await stream_pool.close_all(reason="自测结束")
+
+    # 6. Runner 端到端（非流式：正文走内核、图片挂给 after_message_sent）
+    plain_updates = [
+        {
+            "sessionUpdate": "agent_message_chunk",
+            "messageId": "m1",
+            "content": {"type": "text", "text": "哈哈 &&sad&&（括号留着）"},
+        },
+        {"sessionUpdate": "state_update", "state": "idle", "stopReason": "end_turn"},
+    ]
+    plain_plugin = FakeMemePlugin()
+
+    def plain_factory(url, name):
+        return FakeClient(url, name, updates=list(plain_updates))
+
+    plain_pool = pool_mod.SessionPool(client_factory=plain_factory, idle_timeout=300)
+    plain_runner = runner_mod.Alkaid0Runner(
+        plain_pool,
+        {"acp_url": "ws://plugin/acp"},
+        context=FakeStarRegistry(_meme_meta(plain_plugin)),
+    )
+    plain_event = FakeEvent(group_id="572", session_id="572")
+    await plain_runner.reset(
+        request=SimpleNamespace(prompt="在吗"),
+        run_context=SimpleNamespace(context=SimpleNamespace(event=plain_event)),
+        agent_hooks=None,
+        streaming=False,
+    )
+    plain_responses = [response async for response in plain_runner.step_until_done()]
+    plain_final = _chain_text(plain_responses[-1].data["chain"])
+    pending = plain_event.extras.get("meme_manager_pending_images") or []
+    check(
+        "非流式联动：正文去掉标记、其它原样",
+        plain_final == "哈哈 （括号留着）",
+        plain_final,
+    )
+    check(
+        "非流式联动：图片挂给它的 after_message_sent（不在正文里）",
+        [Path(image.path).parent.name for image in pending] == ["sad"]
+        and plain_plugin.sent_images == [],
+        str(pending),
+    )
+    await plain_runner.close()
+    await plain_pool.close_all(reason="自测结束")
+
+    # 7. 正文里没有标记时不去惊动管理器（不动正文、也不取图）
+    quiet_updates = [
+        {
+            "sessionUpdate": "agent_message_chunk",
+            "messageId": "m1",
+            "content": {"type": "text", "text": "今天天气不错 [sad] （也留着）"},
+        },
+        {"sessionUpdate": "state_update", "state": "idle", "stopReason": "end_turn"},
+    ]
+    quiet_plugin = FakeMemePlugin()
+
+    def quiet_factory(url, name):
+        return FakeClient(url, name, updates=list(quiet_updates))
+
+    quiet_pool = pool_mod.SessionPool(client_factory=quiet_factory, idle_timeout=300)
+    quiet_runner = runner_mod.Alkaid0Runner(
+        quiet_pool,
+        {"acp_url": "ws://plugin/acp"},
+        context=FakeStarRegistry(_meme_meta(quiet_plugin)),
+    )
+    quiet_event = FakeEvent(group_id="574", session_id="574")
+    await quiet_runner.reset(
+        request=SimpleNamespace(prompt="在吗"),
+        run_context=SimpleNamespace(context=SimpleNamespace(event=quiet_event)),
+        agent_hooks=None,
+        streaming=False,
+    )
+    quiet_responses = [response async for response in quiet_runner.step_until_done()]
+    check(
+        "没有标记时不惊动表情包管理器",
+        _chain_text(quiet_responses[-1].data["chain"])
+        == "今天天气不错 [sad] （也留着）"
+        and quiet_plugin.requested == []
+        and not quiet_event.extras,
+        f"{quiet_plugin.requested} / {quiet_event.extras}",
+    )
+    await quiet_runner.close()
+    await quiet_pool.close_all(reason="自测结束")
+
+    # 8. 没装管理器时什么都不变（回归）
+    bare_updates = [
+        {
+            "sessionUpdate": "agent_message_chunk",
+            "messageId": "m1",
+            "content": {"type": "text", "text": "哈 &&happy&&"},
+        },
+        {"sessionUpdate": "state_update", "state": "idle", "stopReason": "end_turn"},
+    ]
+
+    def bare_factory(url, name):
+        return FakeClient(url, name, updates=list(bare_updates))
+
+    bare_pool = pool_mod.SessionPool(client_factory=bare_factory, idle_timeout=300)
+    bare_runner = runner_mod.Alkaid0Runner(bare_pool, {"acp_url": "ws://plugin/acp"})
+    bare_event = FakeEvent(group_id="573", session_id="573")
+    await bare_runner.reset(
+        request=SimpleNamespace(prompt="在吗"),
+        run_context=SimpleNamespace(context=SimpleNamespace(event=bare_event)),
+        agent_hooks=None,
+        streaming=False,
+    )
+    bare_responses = [response async for response in bare_runner.step_until_done()]
+    check(
+        "没装表情包管理器时标记原样保留",
+        _chain_text(bare_responses[-1].data["chain"]) == "哈 &&happy&&"
+        and not bare_event.extras,
+        _chain_text(bare_responses[-1].data["chain"]),
+    )
+    await bare_runner.close()
+    await bare_pool.close_all(reason="自测结束")
+
+
+asyncio.run(meme_bridge_checks())
 
 asyncio.run(panel_checks())
 asyncio.run(remote_checks())
