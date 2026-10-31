@@ -41,6 +41,14 @@
       "description": "把思考过程一起发出去",
       "hint": "开启后，alkaid0 推送的 agent_thought(_chunk) 会以 reasoning 消息链的形式发出去。以执行器面板为准。"
     },
+    "at_parse_enable": {
+      "description": "启用 at 解析",
+      "hint": "开启后，回复里的 @昵称(QQ号) / @QQ号 / @(QQ号) 会被解析成真正的 at（只取号码，昵称不参与）。只在群聊、且上游是 OneBot（aiocqhttp）时生效；私聊与其它平台保持原文。以执行器面板为准。"
+    },
+    "cq_parse_enable": {
+      "description": "启用 CQ 码解析",
+      "hint": "开启后，回复里的 [CQ:at,qq=…] / [CQ:face,id=…] / [CQ:poke,…] / [CQ:dice] / [CQ:rps] / [CQ:shake] 会解析成对应组件；其它 CQ 码直接删掉，不在聊天里显示。只有 OneBot（aiocqhttp）平台会构造组件，其它平台只删除、不显示。以执行器面板为准。"
+    },
     "auto_approve_enable": {
       "description": "启用工具审批直通（Auto-Approve）",
       "hint": "工具审批的总开关。关闭时维持旧行为：session/request_permission 一律挂起，等群友发 /aapprove；开启后才按「配置白名单 / 提示词 / 外部钩子」三层授权自动放行。以执行器面板为准。"
@@ -105,7 +113,7 @@
         },
         "chat": {
           "title": "聊天回显",
-          "description": "控制工具调用等过程消息、以及思考过程是否发到群里。"
+          "description": "控制工具调用等过程消息、思考过程与 at / CQ 码解析是否发到群里。"
         },
         "auto_approve": {
           "title": "工具审批直通",

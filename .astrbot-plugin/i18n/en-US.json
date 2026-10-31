@@ -41,6 +41,14 @@
       "description": "Send reasoning/thoughts to the chat",
       "hint": "When enabled, agent_thought(_chunk) updates are sent as reasoning message chains. The runner panel takes precedence."
     },
+    "at_parse_enable": {
+      "description": "Parse mentions in replies",
+      "hint": "When enabled, @name(QQ) / @QQ / @(QQ) in replies become real mentions (only the number is used; the name is ignored). Only applies to group chats on an OneBot (aiocqhttp) upstream; private chats and other platforms keep the original text. The runner panel takes precedence."
+    },
+    "cq_parse_enable": {
+      "description": "Parse CQ codes in replies",
+      "hint": "When enabled, [CQ:at,qq=...] / [CQ:face,id=...] / [CQ:poke,...] / [CQ:dice] / [CQ:rps] / [CQ:shake] in replies become components; every other CQ code is removed and never shown. Only the OneBot (aiocqhttp) platform builds components; other platforms just remove them. The runner panel takes precedence."
+    },
     "auto_approve_enable": {
       "description": "Enable tool approval passthrough (Auto-Approve)",
       "hint": "Master switch for tool approvals. When disabled, session/request_permission is always deferred until someone sends /aapprove. When enabled, approvals may pass through the configured whitelist, prompt grants, or external hook grants. The runner panel value takes precedence."
@@ -105,7 +113,7 @@
         },
         "chat": {
           "title": "Chat echo",
-          "description": "Control whether progress events and reasoning are sent to the chat."
+          "description": "Control whether progress events, reasoning, mention and CQ parsing are sent to the chat."
         },
         "auto_approve": {
           "title": "Tool approval passthrough",

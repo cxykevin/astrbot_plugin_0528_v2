@@ -34,7 +34,7 @@ from astrbot.core.astr_agent_context import AstrAgentContext
 from astrbot.core.message.message_event_result import MessageChain
 from astrbot.core.provider.entities import LLMResponse, ProviderRequest
 
-from . import meme_bridge
+from . import at_parse, cq_parse, meme_bridge
 from .acp import ACPConnectionError, ACPError, GroupSession, SessionPool
 from .acp import approval as approval_mod
 from .acp import protocol as acp
@@ -81,6 +81,8 @@ RUNNER_CONFIG_DEFAULT: dict[str, T.Any] = {
     "turn_timeout_sec": DEFAULT_TURN_TIMEOUT_SEC,
     "echo_events": True,
     "show_thought": False,
+    "at_parse_enable": False,
+    "cq_parse_enable": False,
     "auto_approve_enable": False,
     "auto_approve_tools": "",
     "auto_approve_prompt": True,
@@ -124,6 +126,25 @@ RUNNER_CONFIG_METADATA: dict[str, T.Any] = {
         "description": "把思考过程一起发出去",
         "type": "bool",
         "hint": "开启后 agent_thought 会被放进 reasoning 消息链。",
+    },
+    "at_parse_enable": {
+        "description": "启用 at 解析",
+        "type": "bool",
+        "hint": (
+            "把回复里的 @昵称(QQ号) / @QQ号 / @(QQ号) 解析成真正的 at（只取号码，"
+            "昵称不参与）。只在群聊、且上游是 OneBot（aiocqhttp）时生效；"
+            "私聊与其它平台保持原文。"
+        ),
+    },
+    "cq_parse_enable": {
+        "description": "启用 CQ 码解析",
+        "type": "bool",
+        "hint": (
+            "把回复里的 [CQ:at,qq=…] / [CQ:face,id=…] / [CQ:poke,…] / "
+            "[CQ:dice] / [CQ:rps] / [CQ:shake] 解析成组件；其它 CQ 码直接删掉，"
+            "不在聊天里显示。只有 OneBot（aiocqhttp）平台会构造组件，"
+            "其它平台只删除、不显示。"
+        ),
     },
     "auto_approve_enable": {
         "description": "启用工具审批直通（Auto-Approve）",
@@ -228,6 +249,8 @@ class RunnerSettings:
         turn_timeout_sec: 单轮最大等待秒数。
         echo_events: 是否把过程消息（工具调用 / 子 Agent / 后台任务）回显进回复。
         show_thought: 是否把思考过程也作为 reasoning 消息发出。
+        at_parse_enable: 是否把回复里的 ``@昵称(QQ号)`` 等写法解析成真正的 at。
+        cq_parse_enable: 是否把回复里的 CQ 码解析成组件（不支持的 CQ 码直接删掉）。
         auto_approve_enable: 工具审批直通总开关。
         auto_approve_tools: 自动批准的工具白名单（逗号 / 空格分隔，支持通配）。
         auto_approve_prompt: 是否允许提示词里的 ``[auto_approve: ...]`` 临时授权。
@@ -240,6 +263,8 @@ class RunnerSettings:
     turn_timeout_sec: float = float(DEFAULT_TURN_TIMEOUT_SEC)
     echo_events: bool = True
     show_thought: bool = False
+    at_parse_enable: bool = False
+    cq_parse_enable: bool = False
     auto_approve_enable: bool = False
     auto_approve_tools: str = ""
     auto_approve_prompt: bool = True
@@ -274,6 +299,12 @@ class RunnerSettings:
             ),
             show_thought=_as_bool(
                 _pick(provider_config, plugin_config, "show_thought"), False
+            ),
+            at_parse_enable=_as_bool(
+                _pick(provider_config, plugin_config, "at_parse_enable"), False
+            ),
+            cq_parse_enable=_as_bool(
+                _pick(provider_config, plugin_config, "cq_parse_enable"), False
             ),
             auto_approve_enable=_as_bool(
                 _pick(provider_config, plugin_config, "auto_approve_enable"), False
@@ -1174,6 +1205,55 @@ class Alkaid0Runner(BaseAgentRunner[AstrAgentContext]):
         queue: asyncio.Queue[tuple[str, dict]] = asyncio.Queue()
         #: 表情包联动（没装 / 没启用时为 ``None``，整条路径不生效）
         meme = meme_bridge.bridge_for(self._plugin_context(), event)
+        #: at 解析：只在 OneBot 上游的群聊里启用（私聊 / 其它平台保持原文）
+        at_filter = (
+            at_parse.AtFilter()
+            if settings.at_parse_enable and at_parse.supported(event)
+            else None
+        )
+        #: CQ 码解析：所有平台都会删掉 CQ 码，只有 OneBot 才构造组件。
+        cq_filter = (
+            cq_parse.CqFilter(components=cq_parse.platform_supported(event))
+            if settings.cq_parse_enable
+            else None
+        )
+
+        def _expand_at(
+            parts: list[at_parse.Part], *, streaming: bool
+        ) -> list[at_parse.Part]:
+            """文本片段再过一遍 at 解析（流式走 AtFilter，最后走纯函数）。"""
+            out: list[at_parse.Part] = []
+            for kind, value in parts:
+                if kind != "text":
+                    out.append((kind, value))
+                elif at_filter is None:
+                    if value:
+                        out.append((kind, value))
+                elif streaming:
+                    out.extend(at_filter.feed(value))
+                else:
+                    out.extend(at_parse.parts_of(value))
+            return out
+
+        def _stream_parts(raw: str) -> list[at_parse.Part]:
+            """流式增量：CQ 过滤 → at 解析。"""
+            cq_parts = (
+                cq_filter.feed(raw)
+                if cq_filter is not None
+                else ([("text", raw)] if raw else [])
+            )
+            return _expand_at(cq_parts, streaming=True)
+
+        def _flush_parts(raw: str) -> list[at_parse.Part]:
+            """收尾：吐出 CQ 与 at 两个过滤器压着的内容。"""
+            if cq_filter is not None:
+                cq_parts = cq_filter.feed(raw) + cq_filter.finish()
+            else:
+                cq_parts = [("text", raw)] if raw else []
+            parts = _expand_at(cq_parts, streaming=True)
+            if at_filter is not None:
+                parts.extend(at_filter.finish())
+            return parts
 
         def _on_notification(method: str, params: dict) -> None:
             queue.put_nowait((method, params))
@@ -1271,12 +1351,13 @@ class Alkaid0Runner(BaseAgentRunner[AstrAgentContext]):
                         # 表情包标记边收边挡：群里只看到正文，标记交给 meme_manager。
                         # 整消息 upsert 不走增量（同一段正文会被重复发一次）。
                         visible = meme.filter_delta(text) if meme is not None else text
-                        if visible:
+                        # CQ / at 解析同样边收边做：两个过滤器都会压住没收完的部分。
+                        parts = _stream_parts(visible)
+                        delta_chain = at_parse.parts_to_chain(parts)
+                        if delta_chain.chain:
                             yield AgentResponse(
                                 type="streaming_delta",
-                                data=AgentResponseData(
-                                    chain=MessageChain().message(visible)
-                                ),
+                                data=AgentResponseData(chain=delta_chain),
                             )
                 elif kind in (acp.UPDATE_AGENT_THOUGHT_CHUNK, acp.UPDATE_AGENT_THOUGHT):
                     text = acp.extract_text(update.get("content"))
@@ -1369,6 +1450,7 @@ class Alkaid0Runner(BaseAgentRunner[AstrAgentContext]):
             # 消息，所以不受 echo_events 开关影响。
             transcript.add_progress("🛑 本轮已终止")
 
+        tail = ""
         if meme is not None:
             # 流式收尾：清理器可能还压着半截文本（正好停在 ``&&`` 中间，或者它的
             # 解析器按行缓冲），这一轮已经结束，把剩下的吐出去。
@@ -1377,11 +1459,15 @@ class Alkaid0Runner(BaseAgentRunner[AstrAgentContext]):
                 logger.debug(
                     "%s: 群 %s 流式正文补发尾巴 %d 字", LOG_PREFIX, session.key, len(tail)
                 )
-                if self.streaming:
-                    yield AgentResponse(
-                        type="streaming_delta",
-                        data=AgentResponseData(chain=MessageChain().message(tail)),
-                    )
+        # CQ / at 清理器也可能压着半截：收尾时一并吐出。
+        tail_parts = _flush_parts(tail)
+        if tail_parts and self.streaming:
+            tail_chain = at_parse.parts_to_chain(tail_parts)
+            if tail_chain.chain:
+                yield AgentResponse(
+                    type="streaming_delta",
+                    data=AgentResponseData(chain=tail_chain),
+                )
 
         body = transcript.text()
         rendered = transcript.render()
@@ -1415,7 +1501,22 @@ class Alkaid0Runner(BaseAgentRunner[AstrAgentContext]):
             if tags:
                 prepared = await meme.build(tags)
         if reply_text:
-            chain.message(reply_text)
+            if cq_filter is not None or at_filter is not None:
+                cq_parts = (
+                    cq_parse.parts_of(
+                        reply_text, components=cq_filter.components
+                    )
+                    if cq_filter is not None
+                    else [("text", reply_text)]
+                )
+                at_parse.parts_to_chain(
+                    _expand_at(cq_parts, streaming=False), chain
+                )
+                if not chain.chain:
+                    # 正文全被 CQ 解析删掉了：给一个空组件让内核跳过，别发兜底错误
+                    chain.message("")
+            else:
+                chain.message(reply_text)
 
         if prepared is not None:
             await self._deliver_memes(meme, prepared, has_text=bool(reply_text))

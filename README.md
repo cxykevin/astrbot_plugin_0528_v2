@@ -91,6 +91,16 @@
     所以群里不会先看到 `&&happy&&`；同一个分类写多次只发一张。非流式时图片跟在正文后面
     单独发（挂给它自己的 `after_message_sent`），真流式时正文已经边收边发过了，由插件直接补发。
     没装 / 停用它时这条路径完全不生效，标记会像以前一样原样留在回复里。
+20. **回复里的 at（可选）**：打开 `at_parse_enable` 后，回复里的 `@昵称(QQ号)` /
+    `@QQ号` / `@(QQ号)` 会变成真正的 at（只取号码，昵称不参与）。只在**群聊**、且上游是
+    OneBot（`aiocqhttp`）时生效；私聊与其它平台保持原文。发送时用 AstrBot 的 `At` 组件，
+    aiocqhttp 会把它写成 OneBot 的 at 段（等价 CQ 码 `[CQ:at,qq=...]`）；流式回复里被拆开的
+    `@` 也会等拼完整再发，不会漏。
+21. **回复里的 CQ 码（可选）**：打开 `cq_parse_enable` 后，回复里的
+    `[CQ:at,qq=…]` / `[CQ:face,id=…]` / `[CQ:poke,…]` / `[CQ:dice]` /
+    `[CQ:rps]` / `[CQ:shake]` 会变成对应的 AstrBot 组件；其它 CQ 码（image、
+    json、xml、合并转发、mface 等）**直接删掉，不显示**。只有 OneBot
+    （`aiocqhttp`）平台会构造组件；其它平台只删除、不显示。`image` 以后再做。
 
 > [!NOTE]
 > 这一版的功能已经比较完整：ACP 传输（连接 / 握手 / 会话 / 提示词 / 通知 / 工具审批）、
@@ -177,6 +187,8 @@ astrbot_plugin_0528_v2/
 ├── api.py             给其它 AstrBot 插件的唤醒接口：`wake(plugin, session, prompt)` + 进程级共享登记
 ├── plugin_wakeup.py   「插件唤醒」配置解析：谁能唤 / 系统提示词 / 回复是否发到群
 ├── agent_runner.py    Alkaid0Runner（一轮对话 → 一次 ACP prompt turn）+ `run_slash_command`（一轮命令）
+├── at_parse.py        回复里的 `@昵称(QQ号)` / `@QQ号` / `@(QQ号)` → 真正的 OneBot at（仅 OneBot 群聊生效）
+├── cq_parse.py        回复里的 CQ 码 → AstrBot 组件（at / face / poke / dice / rps / shake；其它删掉）
 ├── meme_bridge.py     与「表情包管理器」（meme_manager）联动：`&&分类键&&` 的清理、交棒与发图
 ├── proactive.py       常驻监听：把 cron / 其它客户端发起的回合（没有本地 prompt）主动推回群聊
 ├── wakeup_hook.py     HTTP 唤醒钩子：cron 唤醒时续接会话、等送达并转发回复；一键写入 alkaid0 钩子
@@ -222,6 +234,8 @@ astrbot_plugin_0528_v2/
 | `turn_timeout_sec` | int | `900` | 提交 prompt 后最多等多久（等到本轮 `idle`） |
 | `echo_events` | bool | `true` | 是否把过程消息（工具调用 / 子 Agent / 后台任务结束）回显到聊天里；关闭后只发最终答复（工具审批提示始终发） |
 | `show_thought` | bool | `false` | 是否把思考过程作为 reasoning 消息一起发出 |
+| `at_parse_enable` | bool | `false` | 是否把回复里的 `@昵称(QQ号)` / `@QQ号` / `@(QQ号)` 解析成真正的 at（只取号码，昵称不参与）。只在群聊、且上游是 OneBot（`aiocqhttp`）时生效；私聊与其它平台保持原文 |
+| `cq_parse_enable` | bool | `false` | 是否把回复里的 `[CQ:at,qq=…]` / `[CQ:face,id=…]` / `[CQ:poke,…]` / `[CQ:dice]` / `[CQ:rps]` / `[CQ:shake]` 解析成组件；其它 CQ 码直接删掉、不显示。只有 OneBot（`aiocqhttp`）平台会构造组件，其它平台只删除 |
 | `auto_approve_enable` | bool | `false` | 工具审批直通总开关；关闭时所有审批都挂起等 `/aapprove` |
 | `auto_approve_tools` | 字符串 | 空 | 自动批准的工具白名单（逗号 / 空格分隔，大小写不敏感，支持 `*` / `?`；单独 `*` 表示全部） |
 | `auto_approve_prompt` | bool | `true` | 是否允许本轮消息里的 `[auto_approve: read, edit]` 临时授权（只对本轮生效，标记会从提示词删掉） |
@@ -452,6 +466,10 @@ uv run ruff check data/plugins/astrbot_plugin_0528_v2/
   `&&happy&&`。没装 / 停用它时整条路径不生效，标记原样留在回复里。**cron / 其它客户端
   发起的主动回合还没接**（`proactive.py` 与唤醒钩子 relay 走的是另一条发送路径），
   那两条路上的标记会原样发到群里；
+- **CQ 码解析只覆盖「本地回合」的回复**：只做 at / face / poke / dice / rps / shake；
+  其它 CQ 码（包括 image、json、xml、合并转发、mface）在开关打开时**直接删掉、不显示**，
+  image 以后再做。非 OneBot 平台只删除、不构造组件；`/acmd` 与主动推送（cron）的回复
+  还没接这条解析。
 - **配置面板只编辑标量字段**：`_conf_schema.json` 里的 `bool` / `string` / `int` /
   `float` / `text` 会出现在面板里；`list` / `object` / `template_list` 等复杂类型仍走
   原生配置页。ACP 地址 / 仓库地址里的凭证显示为 `***`，保存时按字段名还原；

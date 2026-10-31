@@ -67,6 +67,8 @@ if "ASTRBOT_ROOT" not in os.environ:
 
 from data.plugins.astrbot_plugin_0528_v2 import agent_runner as runner_mod
 from data.plugins.astrbot_plugin_0528_v2 import api as wake_api
+from data.plugins.astrbot_plugin_0528_v2 import at_parse as at_parse_mod
+from data.plugins.astrbot_plugin_0528_v2 import cq_parse as cq_parse_mod
 from data.plugins.astrbot_plugin_0528_v2 import main as own_main
 from data.plugins.astrbot_plugin_0528_v2 import meme_bridge as meme_bridge_mod
 from data.plugins.astrbot_plugin_0528_v2 import panel as panel_mod
@@ -5458,6 +5460,8 @@ check(
         "turn_timeout_sec",
         "echo_events",
         "show_thought",
+        "at_parse_enable",
+        "cq_parse_enable",
         "auto_approve_enable",
         "auto_approve_tools",
         "auto_approve_prompt",
@@ -5491,6 +5495,8 @@ check(
         "turn_timeout_sec",
         "echo_events",
         "show_thought",
+        "at_parse_enable",
+        "cq_parse_enable",
         "auto_approve_enable",
         "auto_approve_tools",
         "auto_approve_prompt",
@@ -7040,7 +7046,345 @@ async def meme_bridge_checks():
     await bare_pool.close_all(reason="自测结束")
 
 
+async def cq_parse_checks():
+    """CQ 码解析：只做 at / face / poke / dice / rps / shake，其它删掉。"""
+
+    def _components(text, components=True):
+        parts = cq_parse_mod.parts_of(text, components=components)
+        return (
+            [value for kind, value in parts if kind == "component"],
+            [value for kind, value in parts if kind == "text"],
+        )
+
+    comps, texts = _components("你好[CQ:at,qq=123456]和[CQ:face,id=14]！")
+    check(
+        "CQ 解析：at / face 转组件，文本原样",
+        [type(c).__name__ for c in comps] == ["At", "Face"]
+        and str(getattr(comps[0], "qq", "")) == "123456"
+        and getattr(comps[1], "id", None) == 14
+        and texts == ["你好", "和", "！"],
+        f"{[type(c).__name__ for c in comps]} / {texts}",
+    )
+
+    comps, texts = _components(
+        "[CQ:poke,type=126,id=10001][CQ:dice][CQ:rps][CQ:shake]"
+    )
+    check(
+        "CQ 解析：poke / dice / rps / shake 转组件",
+        [type(c).__name__ for c in comps] == ["Poke", "Dice", "RPS", "Shake"]
+        and str(getattr(comps[0], "id", "")) == "10001"
+        and texts == [],
+        f"{[type(c).__name__ for c in comps]} / {texts}",
+    )
+
+    comps, texts = _components(
+        "前[CQ:image,file=a.jpg]后[CQ:json,data=%7B%7D][CQ:node,id=1]"
+    )
+    check(
+        "CQ 解析：不做的类型直接删掉，不留原文",
+        comps == [] and texts == ["前", "后"],
+        f"{comps} / {texts}",
+    )
+
+    comps, texts = _components("&#91;CQ:at,qq=456&#93;好")
+    check(
+        "CQ 解析：转义形式的 CQ 码也认",
+        [type(c).__name__ for c in comps] == ["At"]
+        and str(getattr(comps[0], "qq", "")) == "456"
+        and texts == ["好"],
+        f"{comps} / {texts}",
+    )
+    check(
+        "CQ 解析：非 OneBot 平台只删不构造组件",
+        _components("[CQ:at,qq=123]", components=False) == ([], []),
+    )
+    check(
+        "CQ 解析：未闭合的 CQ 码保持原文",
+        cq_parse_mod.parts_of("[CQ:at,qq=1") == [("text", "[CQ:at,qq=1")],
+        repr(cq_parse_mod.parts_of("[CQ:at,qq=1")),
+    )
+
+    chunked = cq_parse_mod.CqFilter(components=True)
+    first = chunked.feed("你好[CQ:at,q")
+    second = chunked.feed("q=123]！")
+    rest = chunked.finish()
+    check(
+        "CQ 解析流式：跨分片的 CQ 码先压住、拼好后转组件",
+        first == [("text", "你好")]
+        and [kind for kind, _ in second] == ["component", "text"]
+        and type(second[0][1]).__name__ == "At"
+        and second[1] == ("text", "！")
+        and rest == [],
+        repr([first, second, rest]),
+    )
+    delete_filter = cq_parse_mod.CqFilter(components=False)
+    check(
+        "CQ 解析流式：非 OneBot 平台删除跨分片的 CQ 码",
+        delete_filter.feed("a[CQ:at,") == [("text", "a")]
+        and delete_filter.feed("qq=1]b") == [("text", "b")]
+        and delete_filter.finish() == [],
+    )
+    check(
+        "CQ 解析开关：默认关闭，面板 / 插件配置都能打开",
+        runner_mod.RunnerSettings.from_config(None, None).cq_parse_enable is False
+        and runner_mod.RunnerSettings.from_config(
+            {"cq_parse_enable": True}, {"cq_parse_enable": False}
+        ).cq_parse_enable
+        and runner_mod.RunnerSettings.from_config(
+            None, {"cq_parse_enable": "true"}
+        ).cq_parse_enable,
+    )
+
+    cq_updates = [
+        {
+            "sessionUpdate": "agent_message_chunk",
+            "messageId": "m1",
+            "content": {"type": "text", "text": "你好[CQ:at,qq=123]！"},
+        },
+        {"sessionUpdate": "state_update", "state": "idle", "stopReason": "end_turn"},
+    ]
+
+    async def _reply(event, *, enabled=True):
+        pool = pool_mod.SessionPool(
+            client_factory=lambda url, name: FakeClient(
+                url, name, updates=list(cq_updates)
+            ),
+            idle_timeout=300,
+        )
+        runner = runner_mod.Alkaid0Runner(pool, {"acp_url": "ws://plugin/acp"})
+        await runner.reset(
+            request=SimpleNamespace(prompt="在吗"),
+            run_context=SimpleNamespace(context=SimpleNamespace(event=event)),
+            agent_hooks=None,
+            provider_config={"cq_parse_enable": enabled},
+            streaming=False,
+        )
+        responses = [response async for response in runner.step_until_done()]
+        await runner.close()
+        await pool.close_all(reason="自测结束")
+        return responses[-1].data["chain"]
+
+    onebot_chain = await _reply(
+        FakeEvent(group_id="611", session_id="611", platform="aiocqhttp")
+    )
+    other_chain = await _reply(
+        FakeEvent(group_id="612", session_id="612", platform="webchat")
+    )
+    off_chain = await _reply(
+        FakeEvent(group_id="613", session_id="613", platform="aiocqhttp"),
+        enabled=False,
+    )
+    check(
+        "Runner：OneBot 群聊把 CQ at 变成组件",
+        _chain_text(onebot_chain) == "你好！"
+        and [type(c).__name__ for c in onebot_chain.chain]
+        == ["Plain", "At", "Plain"],
+        f"{_chain_text(onebot_chain)} / {[type(c).__name__ for c in onebot_chain.chain]}",
+    )
+    check(
+        "Runner：非 OneBot 平台删掉 CQ 码、但不构造组件",
+        _chain_text(other_chain) == "你好！"
+        and all(type(c).__name__ == "Plain" for c in other_chain.chain)
+        and "CQ:" not in _chain_text(other_chain),
+        f"{_chain_text(other_chain)} / {[type(c).__name__ for c in other_chain.chain]}",
+    )
+    check(
+        "Runner：关闭开关时 CQ 码原样保留",
+        _chain_text(off_chain) == "你好[CQ:at,qq=123]！"
+        and [type(c).__name__ for c in off_chain.chain] == ["Plain"],
+        _chain_text(off_chain),
+    )
+
+
+async def at_parse_checks():
+    """at 解析（@昵称(QQ号) / @QQ号 / @(QQ号)）：只在 OneBot 群聊生效。"""
+    parsed = at_parse_mod.parts_of("你好 @张三(123456)，@654321 和 @(777777)。")
+    check(
+        "at 解析：三种写法都取号码、昵称不参与",
+        parsed
+        == [
+            ("text", "你好 "),
+            ("at", "123456"),
+            ("text", "，"),
+            ("at", "654321"),
+            ("text", " 和 "),
+            ("at", "777777"),
+            ("text", "。"),
+        ],
+        repr(parsed),
+    )
+    check(
+        "at 解析：全角括号、带空格的名字、只取括号里的号码",
+        at_parse_mod.parts_of("@John Doe（987654）结束")
+        == [("at", "987654"), ("text", "结束")],
+        repr(at_parse_mod.parts_of("@John Doe（987654）结束")),
+    )
+    check(
+        "at 解析：邮箱、非号码与超长号码保持原文",
+        at_parse_mod.parts_of("a@123456 @1234 @1234567890123 @name")
+        == [("text", "a@123456 @1234 @1234567890123 @name")],
+        repr(at_parse_mod.parts_of("a@123456 @1234 @1234567890123 @name")),
+    )
+    check(
+        "at 解析：全角数字不算 QQ 号",
+        at_parse_mod.parts_of("@１２３４５６") == [("text", "@１２３４５６")],
+        repr(at_parse_mod.parts_of("@１２３４５６")),
+    )
+
+    chain = at_parse_mod.message_chain("你好 @张三(123456)！")
+    plain_texts = [
+        component.text
+        for component in chain.chain
+        if type(component).__name__ == "Plain"
+    ]
+    at_component = next(
+        (component for component in chain.chain if type(component).__name__ == "At"),
+        None,
+    )
+    check(
+        "at 解析：发送链用 At 组件（真正的 OneBot at 段）",
+        [type(component).__name__ for component in chain.chain]
+        == ["Plain", "At", "Plain"]
+        and str(getattr(at_component, "qq", "")) == "123456"
+        and plain_texts == ["你好 ", "！"],
+        f"{[type(c).__name__ for c in chain.chain]} / {getattr(at_component, 'qq', None)}",
+    )
+    check(
+        "at 解析：只在 OneBot 群聊启用（私聊 / 其它平台不生效）",
+        at_parse_mod.supported(FakeEvent(group_id="555", platform="aiocqhttp"))
+        and not at_parse_mod.supported(FakeEvent(group_id="", platform="aiocqhttp"))
+        and not at_parse_mod.supported(FakeEvent(group_id="555", platform="webchat"))
+        and not at_parse_mod.supported(None),
+    )
+    check(
+        "at 解析开关：默认关闭，面板 / 插件配置都能打开",
+        runner_mod.RunnerSettings.from_config(None, None).at_parse_enable is False
+        and runner_mod.RunnerSettings.from_config(
+            {"at_parse_enable": True}, {"at_parse_enable": False}
+        ).at_parse_enable
+        and runner_mod.RunnerSettings.from_config(
+            None, {"at_parse_enable": "true"}
+        ).at_parse_enable,
+    )
+
+    chunked = at_parse_mod.AtFilter()
+    first = chunked.feed("你好 @张")
+    second = chunked.feed("三(123456)，今天真好")
+    rest = chunked.finish()
+    check(
+        "at 解析流式：跨分片的 @ 先压住、拼好后给出 At",
+        first == [("text", "你好 ")]
+        and second == [("at", "123456"), ("text", "，今天真好")]
+        and rest == [],
+        repr([first, second, rest]),
+    )
+    digits = at_parse_mod.AtFilter()
+    check(
+        "at 解析流式：@号码 被拆开也能补齐",
+        digits.feed("@123") == []
+        and digits.feed("45 你好") == [("at", "12345"), ("text", " 你好")]
+        and digits.finish() == [],
+        repr(digits.finish()),
+    )
+    tail = at_parse_mod.AtFilter()
+    check(
+        "at 解析流式：收尾吐出压着的普通 @",
+        tail.feed("hi @张") == [("text", "hi ")]
+        and tail.finish() == [("text", "@张")],
+    )
+    check(
+        "at 解析流式：长文本里的普通 @ 不无限压着",
+        at_parse_mod.AtFilter().feed("@" + "x" * 40) == [("text", "@" + "x" * 40)],
+        repr(at_parse_mod.AtFilter().feed("@" + "x" * 40)),
+    )
+
+    # Runner 端到端：群聊开启 → At 组件；私聊 / 其它平台 / 关闭 → 原文
+    at_updates = [
+        {
+            "sessionUpdate": "agent_message_chunk",
+            "messageId": "m1",
+            "content": {"type": "text", "text": "你好 @张三(123456)！"},
+        },
+        {"sessionUpdate": "state_update", "state": "idle", "stopReason": "end_turn"},
+    ]
+
+    def at_factory(url, name):
+        return FakeClient(url, name, updates=list(at_updates))
+
+    at_pool = pool_mod.SessionPool(client_factory=at_factory, idle_timeout=300)
+    at_runner = runner_mod.Alkaid0Runner(at_pool, {"acp_url": "ws://plugin/acp"})
+    at_event = FakeEvent(group_id="601", session_id="601", platform="aiocqhttp")
+    await at_runner.reset(
+        request=SimpleNamespace(prompt="在吗"),
+        run_context=SimpleNamespace(context=SimpleNamespace(event=at_event)),
+        agent_hooks=None,
+        provider_config={"at_parse_enable": True},
+        streaming=False,
+    )
+    at_responses = [response async for response in at_runner.step_until_done()]
+    at_chain = at_responses[-1].data["chain"]
+    check(
+        "Runner：群聊开启 at 解析后回复里是 At 组件",
+        _chain_text(at_chain) == "你好 ！"
+        and [type(c).__name__ for c in at_chain.chain] == ["Plain", "At", "Plain"]
+        and [
+            str(getattr(c, "qq", ""))
+            for c in at_chain.chain
+            if type(c).__name__ == "At"
+        ]
+        == ["123456"],
+        f"{_chain_text(at_chain)} / {[type(c).__name__ for c in at_chain.chain]}",
+    )
+    await at_runner.close()
+    await at_pool.close_all(reason="自测结束")
+
+    async def _plain_at_reply(event, *, provider_config=None):
+        pool = pool_mod.SessionPool(
+            client_factory=lambda url, name: FakeClient(
+                url, name, updates=list(at_updates)
+            ),
+            idle_timeout=300,
+        )
+        runner = runner_mod.Alkaid0Runner(pool, {"acp_url": "ws://plugin/acp"})
+        await runner.reset(
+            request=SimpleNamespace(prompt="在吗"),
+            run_context=SimpleNamespace(context=SimpleNamespace(event=event)),
+            agent_hooks=None,
+            provider_config=provider_config,
+            streaming=False,
+        )
+        responses = [response async for response in runner.step_until_done()]
+        await runner.close()
+        await pool.close_all(reason="自测结束")
+        return responses[-1].data["chain"]
+
+    private_chain = await _plain_at_reply(
+        FakeEvent(group_id="", session_id="602", platform="aiocqhttp"),
+        provider_config={"at_parse_enable": True},
+    )
+    other_chain = await _plain_at_reply(
+        FakeEvent(group_id="603", session_id="603", platform="webchat"),
+        provider_config={"at_parse_enable": True},
+    )
+    off_chain = await _plain_at_reply(
+        FakeEvent(group_id="604", session_id="604", platform="aiocqhttp")
+    )
+    check(
+        "Runner：私聊 / 其它平台 / 关闭开关时保持原文",
+        all(
+            _chain_text(chain) == "你好 @张三(123456)！"
+            and [type(c).__name__ for c in chain.chain] == ["Plain"]
+            for chain in (private_chain, other_chain, off_chain)
+        ),
+        f"{_chain_text(private_chain)} / {_chain_text(other_chain)} / {_chain_text(off_chain)}",
+    )
+
+
 asyncio.run(meme_bridge_checks())
+
+asyncio.run(at_parse_checks())
+
+asyncio.run(cq_parse_checks())
 
 asyncio.run(panel_checks())
 asyncio.run(remote_checks())
