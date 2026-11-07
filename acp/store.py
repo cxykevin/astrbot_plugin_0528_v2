@@ -4,15 +4,19 @@
 下一条消息带着记录里的 ``sessionId`` 走 ``session/resume`` 续接同一个会话，
 而不是每来一条消息就开一个新会话。
 
-同一个文件里还有两张表：``turn_queue`` —— 群里正跑着一轮时别人插的话先记在那儿
+同一个文件里还有四张表：``turn_queue`` —— 群里正跑着一轮时别人插的话先记在那儿
 （见 :mod:`turn_queue`），AstrBot 意外停掉也能在下次启动时捞回来接着处理；
-``conv_workdirs`` —— ``/aworkdir`` 给某个群绑定的工作目录（相对模板根目录的路径）。
+``conv_workdirs`` —— ``/aworkdir`` 给某个群绑定的工作目录（相对模板根目录的路径）；
+``sent_messages`` —— 每个会话最近发过的消息 ID（引用消息时判断「这条是不是已经给它看过」）；
+``message_history`` —— 每个会话最近收到的消息正文（上下文感知用）。
 
 设计取舍：
 
-* **三张表**：``conv_key -> session_id``（加 ``cwd`` 与 ``updated_at`` 便于诊断）；
+* **五张表**：``conv_key -> session_id``（加 ``cwd`` 与 ``updated_at`` 便于诊断）；
   ``turn_queue`` 是 ``id -> (conv_key, label, text)`` 的追加队列；
   ``conv_workdirs`` 是 ``conv_key -> rel``（``.`` 表示根目录本身）；
+  ``sent_messages`` 是 ``conv_key -> message_id`` 的环形记录（每会话最多 32 条）；
+  ``message_history`` 是 ``conv_key -> 消息正文`` 的环形记录（每会话最多 512 条）；
 * **每次操作现开连接、用完即关**：数据量极小、并发极低，省掉跨事件循环复用
   :class:`sqlite3.Connection` 的麻烦（连接不能跨线程/事件循环借用）；
 * **坏了也不耽误正事**：读写失败只记警告并按「没有记录」处理 —— 会话记录是
@@ -34,6 +38,12 @@ LOG_PREFIX = "0528v2"
 
 #: 读写失败时按「没有记录」处理：SQLite 的错，以及目录不可写等系统错误。
 _STORE_ERRORS = (sqlite3.Error, OSError)
+
+#: 每个会话保留多少条「已经发过」的消息 ID（引用消息时只回看这么多）。
+SENT_MESSAGE_LIMIT = 32
+
+#: 每个会话保留多少条消息正文（上下文感知用；够 2n 次遍历即可）。
+CONTEXT_HISTORY_LIMIT = 512
 
 #: 建表语句（幂等，每次连接都按顺序跑一遍）。
 _SCHEMA = (
@@ -62,6 +72,30 @@ _SCHEMA = (
         updated_at REAL NOT NULL
     )
     """,
+    """
+    CREATE TABLE IF NOT EXISTS sent_messages (
+        id         INTEGER PRIMARY KEY AUTOINCREMENT,
+        conv_key   TEXT NOT NULL,
+        message_id TEXT NOT NULL,
+        created_at REAL NOT NULL,
+        UNIQUE (conv_key, message_id)
+    )
+    """,
+    "CREATE INDEX IF NOT EXISTS sent_messages_by_group "
+    "ON sent_messages (conv_key, id)",
+    """
+    CREATE TABLE IF NOT EXISTS message_history (
+        id          INTEGER PRIMARY KEY AUTOINCREMENT,
+        conv_key    TEXT NOT NULL,
+        message_id  TEXT NOT NULL DEFAULT '',
+        speaker     TEXT NOT NULL DEFAULT '',
+        text        TEXT NOT NULL,
+        image_count INTEGER NOT NULL DEFAULT 0,
+        created_at  REAL NOT NULL
+    )
+    """,
+    "CREATE INDEX IF NOT EXISTS message_history_by_group "
+    "ON message_history (conv_key, id)",
 )
 
 
@@ -276,6 +310,184 @@ class SessionStore:
         except _STORE_ERRORS as exc:
             logger.warning(
                 "%s: 删除工作目录绑定失败（%s）：%s", LOG_PREFIX, self.path, exc
+            )
+            return False
+        return cursor.rowcount > 0
+
+    # ── 已经发过的消息 ID（引用消息去重用）────────────────
+    def remember_sent(
+        self,
+        key: str,
+        message_ids: T.Iterable[str | int],
+        *,
+        limit: int = SENT_MESSAGE_LIMIT,
+    ) -> None:
+        """记下几条已经发给该会话的消息 ID，只保留最近的 ``limit`` 条。
+
+        重复的 ID 不会重复插入；``limit <= 0`` 时只清空不保留。
+        """
+        wanted: list[str] = []
+        seen: set[str] = set()
+        for item in message_ids:
+            text = str(item).strip()
+            if text and text not in seen:
+                seen.add(text)
+                wanted.append(text)
+        if not wanted:
+            return
+        try:
+            with self._open() as conn:
+                conn.executemany(
+                    "INSERT OR IGNORE INTO sent_messages "
+                    "(conv_key, message_id, created_at) VALUES (?, ?, ?)",
+                    [(key, mid, time.time()) for mid in wanted],
+                )
+                if limit <= 0:
+                    conn.execute(
+                        "DELETE FROM sent_messages WHERE conv_key = ?", (key,)
+                    )
+                else:
+                    conn.execute(
+                        """
+                        DELETE FROM sent_messages
+                        WHERE conv_key = ? AND id NOT IN (
+                            SELECT id FROM sent_messages
+                            WHERE conv_key = ? ORDER BY id DESC LIMIT ?
+                        )
+                        """,
+                        (key, key, int(limit)),
+                    )
+        except _STORE_ERRORS as exc:
+            logger.warning(
+                "%s: 记录已发送消息失败（%s）：%s", LOG_PREFIX, self.path, exc
+            )
+
+    def sent_message_ids(
+        self, key: str, *, limit: int = SENT_MESSAGE_LIMIT
+    ) -> list[str]:
+        """该会话最近发过的消息 ID（新的在前），最多 ``limit`` 条。"""
+        if limit <= 0:
+            return []
+        try:
+            with self._open() as conn:
+                rows = conn.execute(
+                    "SELECT message_id FROM sent_messages WHERE conv_key = ? "
+                    "ORDER BY id DESC LIMIT ?",
+                    (key, int(limit)),
+                ).fetchall()
+        except _STORE_ERRORS as exc:
+            logger.warning(
+                "%s: 读取已发送消息失败（%s）：%s", LOG_PREFIX, self.path, exc
+            )
+            return []
+        return [str(row[0]) for row in rows if row and row[0]]
+
+    def forget_sent(self, key: str) -> bool:
+        """清空该会话的已发送记录（新会话 / 换会话 / ``/areset``）。"""
+        try:
+            with self._open() as conn:
+                cursor = conn.execute(
+                    "DELETE FROM sent_messages WHERE conv_key = ?", (key,)
+                )
+        except _STORE_ERRORS as exc:
+            logger.warning(
+                "%s: 清空已发送消息失败（%s）：%s", LOG_PREFIX, self.path, exc
+            )
+            return False
+        return cursor.rowcount > 0
+
+    # ── 消息正文历史（上下文感知用）──────────────────────
+    def add_history(
+        self,
+        key: str,
+        *,
+        message_id: str = "",
+        speaker: str = "",
+        text: str = "",
+        image_count: int = 0,
+        limit: int = CONTEXT_HISTORY_LIMIT,
+    ) -> None:
+        """记下一条收到的消息正文，只保留该会话最近的 ``limit`` 条。
+
+        空正文且没有图片的消息不记（对上下文没有意义）。
+        """
+        body = str(text or "")
+        if not body.strip() and image_count <= 0:
+            return
+        try:
+            with self._open() as conn:
+                conn.execute(
+                    "INSERT INTO message_history "
+                    "(conv_key, message_id, speaker, text, image_count, created_at) "
+                    "VALUES (?, ?, ?, ?, ?, ?)",
+                    (
+                        key,
+                        str(message_id or ""),
+                        str(speaker or ""),
+                        body,
+                        max(0, int(image_count)),
+                        time.time(),
+                    ),
+                )
+                if limit <= 0:
+                    conn.execute(
+                        "DELETE FROM message_history WHERE conv_key = ?", (key,)
+                    )
+                else:
+                    conn.execute(
+                        """
+                        DELETE FROM message_history
+                        WHERE conv_key = ? AND id NOT IN (
+                            SELECT id FROM message_history
+                            WHERE conv_key = ? ORDER BY id DESC LIMIT ?
+                        )
+                        """,
+                        (key, key, int(limit)),
+                    )
+        except _STORE_ERRORS as exc:
+            logger.warning(
+                "%s: 记录消息历史失败（%s）：%s", LOG_PREFIX, self.path, exc
+            )
+
+    def history_entries(
+        self, key: str, *, limit: int = CONTEXT_HISTORY_LIMIT
+    ) -> list[dict]:
+        """该会话最近的消息正文（新的在前），最多 ``limit`` 条。"""
+        if limit <= 0:
+            return []
+        try:
+            with self._open() as conn:
+                rows = conn.execute(
+                    "SELECT message_id, speaker, text, image_count "
+                    "FROM message_history WHERE conv_key = ? "
+                    "ORDER BY id DESC LIMIT ?",
+                    (key, int(limit)),
+                ).fetchall()
+        except _STORE_ERRORS as exc:
+            logger.warning(
+                "%s: 读取消息历史失败（%s）：%s", LOG_PREFIX, self.path, exc
+            )
+            return []
+        return [
+            {
+                "messageId": str(row[0] or ""),
+                "speaker": str(row[1] or ""),
+                "text": str(row[2] or ""),
+                "imageCount": int(row[3] or 0),
+            }
+            for row in rows
+        ]
+
+    def forget_history(self, key: str) -> bool:
+        """清空该会话的消息历史（新会话 / 换会话 / ``/areset``）。"""
+        try:
+            with self._open() as conn:
+                cursor = conn.execute(
+                    "DELETE FROM message_history WHERE conv_key = ?", (key,)
+                )
+        except _STORE_ERRORS as exc:
+            logger.warning(
+                "%s: 清空消息历史失败（%s）：%s", LOG_PREFIX, self.path, exc
             )
             return False
         return cursor.rowcount > 0

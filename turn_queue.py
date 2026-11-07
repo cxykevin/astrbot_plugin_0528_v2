@@ -44,6 +44,7 @@ from dataclasses import dataclass, field
 
 from astrbot.api import logger
 
+from .acp import protocol as acp
 from .acp.store import SessionStore
 
 #: 日志前缀（与插件其它模块一致）。
@@ -71,12 +72,19 @@ class TurnSlot:
         speakers: 这一批里发言的人（攒批时用来标出处，也便于日志）。
         senders: 这一批里每条消息的 ``(发言人, 发送者 ID)``，顺序与 ``text`` 里的发言
             对应 —— 注入 ``[Reminder: @昵称(id)]`` 时按它逐条给（见 :mod:`agent_runner`）。
+        image_refs: 这一批消息附带的图片引用（AstrBot ``ProviderRequest.image_urls``
+            里的原样值），按消息顺序拼接、最多 :data:`acp.MAX_PROMPT_IMAGES` 张；
+            真正解析成 ACP image 块是 :mod:`agent_runner` 的事。
+        message_ids: 这一批里每条消息的 ID（真正发出去后记进「已发送」表，引用消息时
+            用来判断有没有重复带内容）；恢复回来的孤儿没有 ID。
     """
 
     action: str
     text: str = ""
     speakers: tuple[str, ...] = ()
     senders: tuple[tuple[str, str], ...] = ()
+    image_refs: tuple[str, ...] = ()
+    message_ids: tuple[str, ...] = ()
 
 
 def strip_leading_slash(text: str) -> str:
@@ -101,11 +109,17 @@ def merge_prompt(items: list[_Pending]) -> str:
         [张三] 帮我看看 A
         [李四] 顺便看下 B
 
-    没取到发言人的（``label`` 为空）就只放正文。
+    没取到发言人的（``label`` 为空）就只放正文。附带图片的条目会在正文后标一句
+    「（附带 N 张图片）」；只有图片没有文字时整行就是这句标注（否则这一条会在攒批
+    提示词里消失，模型也不知道图片是谁发的）。
     """
     lines = [MERGE_HEADER.format(count=len(items))]
     for item in items:
         body = strip_leading_slash(item.text)
+        image_count = len(getattr(item, "image_refs", ()) or ())
+        if image_count:
+            note = f"（附带 {image_count} 张图片）"
+            body = f"{body}{note}" if body else note
         if not body:
             continue
         lines.append(f"[{item.label}] {body}" if item.label else body)
@@ -124,6 +138,8 @@ class _Pending:
     label: str
     text: str
     sender_id: str = ""
+    image_refs: tuple[str, ...] = ()
+    message_id: str = ""
     future: asyncio.Future | None = field(default=None, repr=False)
     item_id: int | None = None
 
@@ -133,6 +149,19 @@ def _senders(items: list[_Pending]) -> tuple[tuple[str, str], ...]:
     return tuple(
         (item.label, item.sender_id) for item in items if item.label or item.sender_id
     )
+
+
+def _image_refs(items: list[_Pending]) -> tuple[str, ...]:
+    """把一批插话的图片引用按顺序拼起来，最多留 :data:`acp.MAX_PROMPT_IMAGES` 张。"""
+    refs: list[str] = []
+    for item in items:
+        refs.extend(item.image_refs)
+    return tuple(refs[: acp.MAX_PROMPT_IMAGES])
+
+
+def _message_ids(items: list[_Pending]) -> tuple[str, ...]:
+    """把一批插话的消息 ID 抽出来（恢复回来的孤儿没有 ID，直接跳过）。"""
+    return tuple(item.message_id for item in items if item.message_id)
 
 
 class TurnQueue:
@@ -179,6 +208,14 @@ class TurnQueue:
         """这个群当前排着几条插话。"""
         return len(self._waiting.get(key, ()))
 
+    def queued_message_ids(self, key: str) -> tuple[str, ...]:
+        """这个群排在队列里的消息 ID（上下文感知计数时跳过它们）。"""
+        return tuple(
+            item.message_id
+            for item in self._waiting.get(key, ())
+            if item.message_id
+        )
+
     def snapshot(self) -> dict[str, int]:
         """所有有插话排队的群键 → 条数（状态命令用）。"""
         return {key: len(items) for key, items in self._waiting.items() if items}
@@ -218,11 +255,20 @@ class TurnQueue:
         )
         return total
 
-    def _remember(self, key: str, text: str, label: str) -> int | None:
-        """把一条插话记进库，拿到行号；没库 / 写失败返回 None。"""
+    def _remember(
+        self, key: str, text: str, label: str, image_count: int = 0
+    ) -> int | None:
+        """把一条插话记进库，拿到行号；没库 / 写失败返回 None。
+
+        图片本身不进库（base64 太大），纯图片消息存一句占位，恢复时至少还能看出
+        「这里原本有几张图」；带文字的照常只存文字。
+        """
         if self._store is None:
             return None
-        return self._store.add_pending(key, text, label)
+        stored = text
+        if not stored.strip() and image_count:
+            stored = f"（发送了 {image_count} 张图片）"
+        return self._store.add_pending(key, stored, label)
 
     def _forget(self, items: list[_Pending]) -> None:
         """把已经安排掉的插话从库里删掉（没落库的忽略）。"""
@@ -240,14 +286,19 @@ class TurnQueue:
         *,
         speaker: str = "",
         sender_id: str = "",
+        image_refs: tuple[str, ...] = (),
+        message_id: str = "",
     ) -> TurnSlot:
         """申请进闸门：立刻开跑，或者排队等上一轮结束。
 
         Args:
             key: 群/会话键（一般用 ``event.unified_msg_origin``）。
-            text: 本条消息的提示词。
+            text: 本条消息的提示词（纯图片消息可以为空）。
             speaker: 发言的人（攒批时标出处）；取不到就留空。
             sender_id: 发言者的 ID（注入 ``[Reminder: @昵称(id)]`` 用）；取不到就留空。
+            image_refs: 本条消息的图片引用（``ProviderRequest.image_urls`` 原样值），
+                最多 :data:`acp.MAX_PROMPT_IMAGES` 张，攒批时按顺序合并。
+            message_id: 本条消息的 ID（发出去之后记进「已发送」表，供引用消息去重）。
 
         Returns:
             :class:`TurnSlot` —— 见类文档里那段用法。
@@ -255,15 +306,29 @@ class TurnQueue:
         Raises:
             asyncio.CancelledError: 等待期间本任务被取消（会把自己从队列里摘掉）。
         """
+        image_refs = tuple(image_refs[: acp.MAX_PROMPT_IMAGES])
         if key in self._active:
-            return await self._wait(key, text, speaker, sender_id)
+            return await self._wait(
+                key, text, speaker, sender_id, image_refs, message_id
+            )
 
         recovered = self._waiting.pop(key, None) or []
         self._active.add(key)
         if not recovered:
-            mine = _Pending(label=speaker, text=text, sender_id=sender_id)
+            mine = _Pending(
+                label=speaker,
+                text=text,
+                sender_id=sender_id,
+                image_refs=image_refs,
+                message_id=message_id,
+            )
             return TurnSlot(
-                ACTION_RUN, text, (speaker,) if speaker else (), _senders([mine])
+                ACTION_RUN,
+                text,
+                (speaker,) if speaker else (),
+                _senders([mine]),
+                image_refs,
+                _message_ids([mine]),
             )
 
         # 这个群还留着上次（服务端被停掉之前）没来得及处理的插话：本条消息带队，
@@ -276,7 +341,16 @@ class TurnQueue:
         )
         self._forget(recovered)
         return _lead(
-            [*recovered, _Pending(label=speaker, text=text, sender_id=sender_id)]
+            [
+                *recovered,
+                _Pending(
+                    label=speaker,
+                    text=text,
+                    sender_id=sender_id,
+                    image_refs=image_refs,
+                    message_id=message_id,
+                ),
+            ]
         )
 
     async def leave(self, key: str) -> None:
@@ -309,7 +383,14 @@ class TurnQueue:
             speakers = tuple(item.label for item in waiting if item.label)
             if not leader.future.done():
                 leader.future.set_result(
-                    TurnSlot(ACTION_MERGED, text, speakers, _senders(waiting))
+                    TurnSlot(
+                        ACTION_MERGED,
+                        text,
+                        speakers,
+                        _senders(waiting),
+                        _image_refs(waiting),
+                        _message_ids(waiting),
+                    )
                 )
             for item in waiting[1:]:
                 if item.future is not None and not item.future.done():
@@ -365,15 +446,23 @@ class TurnQueue:
 
     # ── 内部 ─────────────────────────────────────────────
     async def _wait(
-        self, key: str, text: str, speaker: str, sender_id: str
+        self,
+        key: str,
+        text: str,
+        speaker: str,
+        sender_id: str,
+        image_refs: tuple[str, ...] = (),
+        message_id: str = "",
     ) -> TurnSlot:
         """群里正跑着一轮：把这条插话记进队列（顺手落库）然后等这一轮结束。"""
         pending = _Pending(
             label=speaker,
             text=text,
             sender_id=sender_id,
+            image_refs=image_refs,
+            message_id=message_id,
             future=asyncio.get_running_loop().create_future(),
-            item_id=self._remember(key, text, speaker),
+            item_id=self._remember(key, text, speaker, len(image_refs)),
         )
         queue = self._waiting.setdefault(key, [])
         queue.append(pending)
@@ -403,4 +492,6 @@ def _lead(items: list[_Pending]) -> TurnSlot:
         merge_prompt(items),
         tuple(item.label for item in items if item.label),
         _senders(items),
+        _image_refs(items),
+        _message_ids(items),
     )

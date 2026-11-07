@@ -511,12 +511,21 @@ class ACPClient:
         session_id: str,
         text: str,
         *,
+        images: T.Sequence[T.Mapping[str, T.Any]] = (),
         timeout: float | None = None,
     ) -> dict:
-        """提交一轮提示词。ACP v2 下这是**立即确认**（``{}``），正文靠通知推送。"""
+        """提交一轮提示词。ACP v2 下这是**立即确认**（``{}``），正文靠通知推送。
+
+        Args:
+            session_id: 目标会话 ID。
+            text: 用户文本（纯图片消息可以留空）。
+            images: 要随消息发送的图片块（``type`` / ``mimeType`` / ``data``），
+                最多 :data:`acp.MAX_PROMPT_IMAGES` 张（alkaid0 扩展文档 §4.3）。
+            timeout: 等待服务端确认的超时。
+        """
         return await self.call(
             acp.METHOD_SESSION_PROMPT,
-            {"sessionId": session_id, "prompt": acp.prompt_blocks(text)},
+            {"sessionId": session_id, "prompt": acp.prompt_blocks(text, images)},
             timeout=timeout,
         )
 

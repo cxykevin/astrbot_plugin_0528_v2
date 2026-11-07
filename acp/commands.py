@@ -23,6 +23,8 @@ from typing import Any
 
 #: alkaid0 私有扩展协议的能力标记；``initialize`` 的 ``capabilities`` 里出现即表示支持。
 CAPABILITY_ALKAID0_V04 = "alk.cxykevin.top/alkaid0/v0.4"
+#: v0.7：``session/prompt`` 支持 image 内容块（扩展文档 §4.3）。
+CAPABILITY_ALKAID0_V07 = "alk.cxykevin.top/alkaid0/v0.7"
 
 #: 服务端命令描述的中文对照表（键 = alkaid0 下发的英文原文，逐字包含标点与大小写）。
 #: 与 alcoh ``internal/i18n/server.go`` 的 ``serverZh`` 一致，每条上方的注释标明对应命令。

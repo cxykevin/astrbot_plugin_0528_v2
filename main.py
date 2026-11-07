@@ -59,7 +59,7 @@ from .turn_queue import TurnQueue
 PLUGIN_NAME = "astrbot_plugin_0528_v2"
 
 #: 插件版本（与 metadata.yaml 的 version 保持一致）。
-PLUGIN_VERSION = "v0.4.1"
+PLUGIN_VERSION = "v0.5.0"
 
 #: 日志前缀。
 LOG_PREFIX = prerequisite_mod.LOG_PREFIX

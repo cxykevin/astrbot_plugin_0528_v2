@@ -65,9 +65,12 @@ os.environ.setdefault("ASTRBOT_DISABLE_METRICS", "1")
 if "ASTRBOT_ROOT" not in os.environ:
     os.environ["ASTRBOT_ROOT"] = tempfile.mkdtemp(prefix="0528v2-selftest-")
 
+from astrbot.core.message.components import Image as AstrImage
+from astrbot.core.message.components import Plain, Reply
 from data.plugins.astrbot_plugin_0528_v2 import agent_runner as runner_mod
 from data.plugins.astrbot_plugin_0528_v2 import api as wake_api
 from data.plugins.astrbot_plugin_0528_v2 import at_parse as at_parse_mod
+from data.plugins.astrbot_plugin_0528_v2 import context_history as context_mod
 from data.plugins.astrbot_plugin_0528_v2 import cq_parse as cq_parse_mod
 from data.plugins.astrbot_plugin_0528_v2 import main as own_main
 from data.plugins.astrbot_plugin_0528_v2 import meme_bridge as meme_bridge_mod
@@ -75,6 +78,7 @@ from data.plugins.astrbot_plugin_0528_v2 import panel as panel_mod
 from data.plugins.astrbot_plugin_0528_v2 import plugin_wakeup as plugin_wakeup_mod
 from data.plugins.astrbot_plugin_0528_v2 import prerequisite as prereq_mod
 from data.plugins.astrbot_plugin_0528_v2 import proactive as proactive_mod
+from data.plugins.astrbot_plugin_0528_v2 import quote_message as quote_mod
 from data.plugins.astrbot_plugin_0528_v2 import remote_config as remote_mod
 from data.plugins.astrbot_plugin_0528_v2 import turn_queue as turn_queue_mod
 from data.plugins.astrbot_plugin_0528_v2 import wakeup_hook as wakeup_mod
@@ -530,6 +534,29 @@ check(
     "prompt 数组是文本块",
     acp_proto.prompt_blocks("hi") == [{"type": "text", "text": "hi"}],
 )
+
+#: 1x1 PNG（用来验证图片解析；与消息附件一样是裸 base64）。
+_PNG_1PX_B64 = (
+    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg=="
+)
+check(
+    "prompt 数组支持 image 块：文本在前、图片在后、最多 4 张",
+    acp_proto.prompt_blocks("", [{"data": "a", "mimeType": "image/png"}])
+    == [{"type": "image", "mimeType": "image/png", "data": "a"}]
+    and acp_proto.prompt_blocks(
+        "看图", [{"data": str(i), "mimeType": "image/png"} for i in range(6)]
+    )
+    == [{"type": "text", "text": "看图"}]
+    + [
+        {"type": "image", "mimeType": "image/png", "data": str(i)}
+        for i in range(4)
+    ]
+    and acp_proto.prompt_blocks(
+        "x", [{"data": ""}, {"mimeType": "image/png"}, "oops"]
+    )
+    == [{"type": "text", "text": "x"}],
+    str(acp_proto.prompt_blocks("看图", [{"data": str(i)} for i in range(6)])),
+)
 check(
     "usage_update 解析：取 used/size，缺字段当 0，坏值一律不算",
     acp_proto.usage_of(
@@ -708,6 +735,8 @@ class FakeEvent:
         sender_id="",
         group_name="",
         group_api_name=None,
+        message_id="",
+        message=None,
     ):
         self._group_id = group_id
         self._session_id = session_id
@@ -719,7 +748,9 @@ class FakeEvent:
         self._group_api_name = group_api_name
         #: 消息对象：注入时优先看 ``message_obj.group.group_name``
         self.message_obj = SimpleNamespace(
-            group=SimpleNamespace(group_name=group_name) if group_name else None
+            group=SimpleNamespace(group_name=group_name) if group_name else None,
+            message_id=message_id,
+            message=list(message or []),
         )
         self.unified_msg_origin = (
             umo or f"{platform}:group:{session_id or group_id or 'default'}"
@@ -841,6 +872,23 @@ check(
     str(_panel_settings),
 )
 check("布尔字符串也能解析", _panel_settings.show_thought is True)
+check(
+    "上下文感知默认关闭、单条默认 150 字",
+    _default_settings.context_count == 0
+    and _default_settings.context_max_chars == 150,
+    str(_default_settings),
+)
+check(
+    "上下文感知可从配置打开（字符串数字也认）",
+    runner_mod.RunnerSettings.from_config(
+        {"context_count": "3", "context_max_chars": "200"}, None
+    ).context_count
+    == 3
+    and runner_mod.RunnerSettings.from_config(
+        {"context_count": "3", "context_max_chars": "200"}, None
+    ).context_max_chars
+    == 200,
+)
 check(
     "过程消息回显默认开启，也能按字符串关掉",
     _default_settings.echo_events is True
@@ -1672,8 +1720,12 @@ class FakeClient:
                 option["currentValue"] = value
         return {"configOptions": options}
 
-    async def session_prompt(self, session_id, text, timeout=None):
-        self.calls.append(("session/prompt", {"sessionId": session_id, "text": text}))
+    async def session_prompt(self, session_id, text, *, images=(), timeout=None):
+        payload = {"sessionId": session_id, "text": text}
+        if images:
+            # 没有图片时不加这个键：旧断言只看 sessionId / text，保持原样
+            payload["images"] = [dict(image) for image in images]
+        self.calls.append(("session/prompt", payload))
         if self.fail_prompt:
             # 真机里不认这条命令时：先广播 refusal 的 idle，再回这个 JSON-RPC 错误
             raise ACPError(self.fail_prompt)
@@ -1764,7 +1816,7 @@ class AutoPermissionClient(FakeClient):
         self.permission_result = None
         self.prompt_text = ""
 
-    async def session_prompt(self, session_id, text, timeout=None):
+    async def session_prompt(self, session_id, text, *, images=(), timeout=None):
         self.calls.append(("session/prompt", {"sessionId": session_id, "text": text}))
         self.prompt_text = text
         self._broadcast(session_id, {"sessionUpdate": "state_update", "state": "running"})
@@ -1832,6 +1884,102 @@ async def alkaid0_checks():
         {item["key"] for item in pool.snapshot()} == {"group:a", "group:b", "group:c"},
         str(pool.snapshot()),
     )
+
+    # ── 图片输入：引用清洗、MIME 识别、服务端能力 ──
+    refs = runner_mod.image_refs_of(
+        SimpleNamespace(
+            image_urls=[
+                _PNG_1PX_B64,
+                "  ",
+                None,
+                "data:image/png;base64," + _PNG_1PX_B64,
+            ]
+        )
+    )
+    check(
+        "image_refs_of：只留非空字符串引用",
+        refs == (_PNG_1PX_B64, "data:image/png;base64," + _PNG_1PX_B64),
+        str(refs),
+    )
+    resolved_images = await runner_mod.resolve_prompt_images(refs)
+    check(
+        "resolve_prompt_images：裸 base64 与 data URI 都解析成 image 块",
+        len(resolved_images) == 2
+        and all(
+            image["type"] == "image" and image["mimeType"] == "image/png"
+            for image in resolved_images
+        )
+        and all(image["data"] == _PNG_1PX_B64 for image in resolved_images),
+        str(resolved_images),
+    )
+    check(
+        "resolve_prompt_images：坏引用静默跳过",
+        await runner_mod.resolve_prompt_images(["definitely-not-an-image"]) == [],
+    )
+
+    # ── 引用消息：没发过才补内容，正文 + 图片都带上 ──
+    quote_event = FakeEvent(
+        group_id="778",
+        session_id="778",
+        umo="aiocqhttp:group:778",
+        message_id="quote-200",
+        message=[
+            Reply(
+                id="quote-100",
+                sender_nickname="小红",
+                sender_id=20003,
+                message_str="",
+                chain=[
+                    Plain(text="旧消息正文"),
+                    AstrImage(file="data:image/png;base64," + _PNG_1PX_B64),
+                ],
+            ),
+            Plain(text="你看这个"),
+        ],
+    )
+    q_text, q_images = quote_mod.quote_context(
+        quote_event, was_sent=lambda mid: False
+    )
+    check(
+        "引用消息：没发过时带正文、发送者与图片",
+        q_text.startswith("[引用消息｜小红(20003)]")
+        and "旧消息正文" in q_text
+        and q_text.endswith("[/引用消息]")
+        and "附图 1 张" in q_text
+        and q_images == ("data:image/png;base64," + _PNG_1PX_B64,),
+        f"{q_text!r} / {q_images!r}",
+    )
+    check(
+        "引用消息：已经发过的不再重复带",
+        quote_mod.quote_context(quote_event, was_sent=lambda mid: mid == "quote-100")
+        == ("", ()),
+    )
+    check(
+        "引用消息：消息 ID 取得到",
+        quote_mod.message_id_of(quote_event) == "quote-200",
+    )
+    cap_pool = pool_mod.SessionPool(
+        client_factory=lambda url, name: FakeClient(
+            url,
+            name,
+            capabilities={acp_commands.CAPABILITY_ALKAID0_V07: {}},
+        ),
+        idle_timeout=300,
+    )
+    plain_cap_pool = pool_mod.SessionPool(
+        client_factory=lambda url, name: FakeClient(url, name), idle_timeout=300
+    )
+    cap_session = await cap_pool.acquire("group:img", url="ws://acp", cwd="/w/img")
+    plain_cap_session = await plain_cap_pool.acquire(
+        "group:noimg", url="ws://acp", cwd="/w/noimg"
+    )
+    check(
+        "只有声明 v0.7 的服务端才认图片能力",
+        cap_session.supports_prompt_images
+        and not plain_cap_session.supports_prompt_images,
+    )
+    await cap_pool.close_all()
+    await plain_cap_pool.close_all()
 
     rebuilt_cwd = await pool.acquire("group:b", url="ws://acp", cwd="/w/b2")
     check(
@@ -1921,9 +2069,160 @@ async def alkaid0_checks():
     )
     check("会话记录：forget 不存在的键返回 False", store.forget("group:r") is False)
     check(
+        "已发送消息：空库读不到",
+        store.sent_message_ids("group:r") == [],
+    )
+    store.remember_sent("group:r", ["101", "102", 103])
+    check(
+        "已发送消息：写入后可读回，重复 ID 不重复",
+        store.sent_message_ids("group:r") == ["103", "102", "101"]
+        and store.sent_message_ids("group:r") == store.sent_message_ids("group:r"),
+        str(store.sent_message_ids("group:r")),
+    )
+    store.remember_sent("group:r", ["101"])
+    check(
+        "已发送消息：重复记同一条不会改变最近顺序",
+        store.sent_message_ids("group:r") == ["103", "102", "101"],
+        str(store.sent_message_ids("group:r")),
+    )
+    store.remember_sent("group:r", [str(i) for i in range(200, 240)])
+    kept = store.sent_message_ids("group:r")
+    check(
+        "已发送消息：每会话只保留最近 32 条",
+        len(kept) == store_mod.SENT_MESSAGE_LIMIT
+        and kept[0] == "239"
+        and kept[-1] == "208",
+        str(kept),
+    )
+    check(
+        "已发送消息：落盘了（新实例读得到）",
+        store_mod.SessionStore(db_path).sent_message_ids("group:r") == kept,
+    )
+    check(
+        "已发送消息：forget_sent 会清空",
+        store.forget_sent("group:r") and store.sent_message_ids("group:r") == [],
+    )
+    check(
+        "已发送消息：路径不可用时降级为空",
+        store_mod.SessionStore("/proc/1/nope/sent.db").sent_message_ids("x") == [],
+    )
+    check(
         "会话记录：路径不可用时降级为「没有记录」",
         store_mod.SessionStore("/proc/1/nope/sessions.db").get("x") is None,
     )
+
+    # ── 上下文感知：历史落库 / 筛选规则 / 渲染 ──────────
+    history = store_mod.SessionStore(db_dir / "history.db")
+    history.add_history("group:h", message_id="h1", speaker="张三", text="第一条")
+    history.add_history(
+        "group:h", message_id="h2", speaker="李四", text="第二条", image_count=2
+    )
+    history.add_history(
+        "group:h", message_id="h3", speaker="王五", text="", image_count=1
+    )
+    history.add_history("group:h", message_id="empty", speaker="赵六", text="")
+    rows = history.history_entries("group:h")
+    check(
+        "上下文历史：新的在前，纯图片用占位，空消息不记",
+        [row["messageId"] for row in rows] == ["h3", "h2", "h1"]
+        and rows[0]["imageCount"] == 1
+        and rows[1]["text"] == "第二条",
+        str(rows),
+    )
+    for index in range(5):
+        history.add_history("group:trim", message_id=f"t{index}", text=str(index))
+    trimmed = history.history_entries("group:trim", limit=3)
+    check(
+        "上下文历史：只保留最近 limit 条",
+        [row["messageId"] for row in trimmed] == ["t4", "t3", "t2"],
+        str(trimmed),
+    )
+    check(
+        "上下文历史：forget_history 会清空",
+        history.forget_history("group:h")
+        and history.history_entries("group:h") == [],
+    )
+    check(
+        "上下文历史：路径不可用时降级为空",
+        store_mod.SessionStore("/proc/1/nope/history.db").history_entries("x")
+        == [],
+    )
+
+    history_messages = [
+        context_mod.ContextMessage(
+            message_id=f"m{index}",
+            speaker="小明",
+            text=f"消息{index}",
+        )
+        for index in range(4, -1, -1)
+    ]
+    check(
+        "上下文筛选：从新往回凑够 n 条，返回时按时间正序",
+        [m.text for m in context_mod.select_context(
+            history_messages, limit=2, max_chars=0
+        )]
+        == ["消息3", "消息4"],
+    )
+    check(
+        "上下文筛选：队列里等着发的消息跳过、不计数",
+        [
+            m.text
+            for m in context_mod.select_context(
+                history_messages,
+                limit=2,
+                max_chars=0,
+                queued_ids={"m4"},
+            )
+        ]
+        == ["消息2", "消息3"],
+    )
+    long_messages = [
+        context_mod.ContextMessage(message_id="long", text="很长" * 10),
+        context_mod.ContextMessage(message_id="a", text="甲"),
+        context_mod.ContextMessage(message_id="b", text="乙"),
+    ]
+    check(
+        "上下文筛选：超过 k 字跳过、不计数",
+        [m.text for m in context_mod.select_context(
+            long_messages, limit=2, max_chars=4
+        )]
+        == ["乙", "甲"],
+    )
+    check(
+        "上下文筛选：最多只遍历 2n 条",
+        [
+            m.text
+            for m in context_mod.select_context(
+                long_messages, limit=1, max_chars=4
+            )
+        ]
+        == ["甲"],
+    )
+    check(
+        "上下文筛选：本轮已要发送的消息不占 2n 遍历额度",
+        [
+            m.text
+            for m in context_mod.select_context(
+                [
+                    context_mod.ContextMessage(message_id="now", text="当前"),
+                    context_mod.ContextMessage(message_id="x", text="很长" * 10),
+                    context_mod.ContextMessage(message_id="old", text="旧"),
+                ],
+                limit=1,
+                max_chars=4,
+                exclude_ids={"now"},
+            )
+        ]
+        == ["旧"],
+    )
+    check(
+        "上下文渲染：带边界标记与发言人",
+        context_mod.render_context(
+            [context_mod.ContextMessage(message_id="a", speaker="小明", text="旧")]
+        )
+        == "[更早的群聊记录（仅供参考）]\n[小明] 旧\n[/更早的群聊记录]",
+    )
+    check("上下文渲染：没有消息时为空串", context_mod.render_context([]) == "")
 
     # 有记录 → session/resume（不带 replayFrom）续接
     record_store = store_mod.SessionStore(db_dir / "resume.db")
@@ -4180,6 +4479,349 @@ async def alkaid0_checks():
     await muted_runner.close()
     await muted_pool.close_all()
 
+    # ── 图片输入：image 块随 session/prompt 发出；纯图片消息也能跑 ──
+    image_updates = [
+        {"sessionUpdate": "state_update", "state": "running"},
+        {
+            "sessionUpdate": "agent_message_chunk",
+            "messageId": "msg_img",
+            "content": {"type": "text", "text": "看到了"},
+        },
+        {
+            "sessionUpdate": "state_update",
+            "state": "idle",
+            "stopReason": "end_turn",
+        },
+    ]
+    image_created = []
+
+    def image_factory(url, name):
+        client = FakeClient(
+            url,
+            name,
+            updates=image_updates,
+            capabilities={acp_commands.CAPABILITY_ALKAID0_V07: {}},
+        )
+        image_created.append(client)
+        return client
+
+    image_pool = pool_mod.SessionPool(client_factory=image_factory, idle_timeout=300)
+    image_runner = runner_mod.Alkaid0Runner(
+        image_pool, {"acp_url": "ws://plugin/acp"}
+    )
+    image_event = FakeEvent(
+        group_id="779", session_id="779", umo="aiocqhttp:group:779"
+    )
+
+    async def _run_image_turn(prompt, images):
+        await image_runner.reset(
+            request=SimpleNamespace(prompt=prompt, image_urls=list(images)),
+            run_context=SimpleNamespace(context=SimpleNamespace(event=image_event)),
+            agent_hooks=None,
+            provider_config={"acp_url": "ws://panel/acp"},
+            streaming=False,
+        )
+        return [response async for response in image_runner.step_until_done()]
+
+    image_responses = await _run_image_turn("看看这个", [_PNG_1PX_B64])
+    image_calls = [
+        call for call in image_created[0].calls if call[0] == "session/prompt"
+    ]
+    check(
+        "图片随 session/prompt 一起发出（文本 + image 块）",
+        image_calls
+        and image_calls[-1][1]["text"] == "看看这个"
+        and len(image_calls[-1][1]["images"]) == 1
+        and image_calls[-1][1]["images"][0]["type"] == "image"
+        and image_calls[-1][1]["images"][0]["mimeType"] == "image/png"
+        and image_calls[-1][1]["images"][0]["data"] == _PNG_1PX_B64,
+        str(image_calls),
+    )
+    check(
+        "带图片的一轮照常收到回复",
+        _chain_text(image_responses[-1].data["chain"]) == "看到了",
+        str(image_responses),
+    )
+
+    pure_responses = await _run_image_turn("", [_PNG_1PX_B64])
+    pure_calls = [
+        call for call in image_created[0].calls if call[0] == "session/prompt"
+    ]
+    check(
+        "纯图片消息：不发空文本块，图片照发",
+        pure_calls
+        and pure_calls[-1][1]["text"] == ""
+        and len(pure_calls[-1][1]["images"]) == 1
+        and _chain_text(pure_responses[-1].data["chain"]) == "看到了",
+        str(pure_calls[-1] if pure_calls else None),
+    )
+    await image_runner.close()
+    await image_pool.close_all()
+
+    # ── 引用消息：发过的跳过，没发过的连正文 + 图片一起带 ──
+    quote_created = []
+
+    def quote_factory(url, name):
+        client = FakeClient(
+            url,
+            name,
+            updates=image_updates,
+            capabilities={acp_commands.CAPABILITY_ALKAID0_V07: {}},
+        )
+        quote_created.append(client)
+        return client
+
+    quote_store = store_mod.SessionStore(db_dir / "quote-run.db")
+    quote_pool = pool_mod.SessionPool(
+        client_factory=quote_factory, idle_timeout=300, store=quote_store
+    )
+    quote_runner = runner_mod.Alkaid0Runner(
+        quote_pool, {"acp_url": "ws://plugin/acp"}
+    )
+    quote_key = "aiocqhttp:group:781"
+
+    async def _run_quote_turn(event, prompt):
+        await quote_runner.reset(
+            request=SimpleNamespace(prompt=prompt),
+            run_context=SimpleNamespace(context=SimpleNamespace(event=event)),
+            agent_hooks=None,
+            provider_config={"acp_url": "ws://panel/acp"},
+            streaming=False,
+        )
+        return [response async for response in quote_runner.step_until_done()]
+
+    first_quote_event = FakeEvent(
+        group_id="781",
+        session_id="781",
+        umo=quote_key,
+        message_id="m-1",
+    )
+    await _run_quote_turn(first_quote_event, "第一条")
+    quote_calls = [
+        call for call in quote_created[0].calls if call[0] == "session/prompt"
+    ]
+    check(
+        "引用消息：普通消息照常发送并记下消息 ID",
+        quote_calls
+        and quote_calls[-1][1]["text"] == "第一条"
+        and quote_store.sent_message_ids(quote_key)[:1] == ["m-1"],
+        str(quote_calls),
+    )
+
+    sent_quote_event = FakeEvent(
+        group_id="781",
+        session_id="781",
+        umo=quote_key,
+        message_id="m-2",
+        message=[
+            Reply(id="m-1", sender_nickname="小明", sender_id=20002),
+            Plain(text="你刚才说的"),
+        ],
+    )
+    await _run_quote_turn(sent_quote_event, "你刚才说的")
+    quote_calls = [
+        call for call in quote_created[0].calls if call[0] == "session/prompt"
+    ]
+    check(
+        "引用消息：引用已经发过的消息时不重复带内容",
+        quote_calls
+        and quote_calls[-1][1]["text"] == "你刚才说的"
+        and "[引用消息" not in quote_calls[-1][1]["text"],
+        str(quote_calls[-1]),
+    )
+
+    new_quote_event = FakeEvent(
+        group_id="781",
+        session_id="781",
+        umo=quote_key,
+        message_id="m-3",
+        message=[
+            Reply(
+                id="m-999",
+                sender_nickname="小红",
+                sender_id=20003,
+                chain=[
+                    Plain(text="没发过的旧消息"),
+                    AstrImage(file="data:image/png;base64," + _PNG_1PX_B64),
+                ],
+            ),
+            Plain(text="继续"),
+        ],
+    )
+    await _run_quote_turn(new_quote_event, "继续")
+    quote_calls = [
+        call for call in quote_created[0].calls if call[0] == "session/prompt"
+    ]
+    last_quote_call = quote_calls[-1] if quote_calls else (None, {})
+    check(
+        "引用消息：没发过时正文与图片一起带进来",
+        last_quote_call[1]
+        and "[引用消息｜小红(20003)]" in last_quote_call[1]["text"]
+        and "没发过的旧消息" in last_quote_call[1]["text"]
+        and last_quote_call[1]["text"].endswith("继续")
+        and len(last_quote_call[1].get("images", [])) == 1
+        and last_quote_call[1]["images"][0]["data"] == _PNG_1PX_B64,
+        str(last_quote_call),
+    )
+    check(
+        "引用消息：只记真正发出去的消息 ID",
+        quote_store.sent_message_ids(quote_key)[:3] == ["m-3", "m-2", "m-1"]
+        and "m-999" not in quote_store.sent_message_ids(quote_key),
+        str(quote_store.sent_message_ids(quote_key)),
+    )
+    await quote_pool.reset_session(quote_key)
+    check(
+        "引用消息：重置会话会清空已发送记录",
+        quote_store.sent_message_ids(quote_key) == [],
+    )
+    await quote_runner.close()
+    await quote_pool.close_all()
+
+    # ── 上下文感知：上一轮消息补进下一轮 ─────────────────
+    ctx_created = []
+
+    def ctx_factory(url, name):
+        client = FakeClient(url, name, updates=image_updates)
+        ctx_created.append(client)
+        return client
+
+    ctx_store = store_mod.SessionStore(db_dir / "context-run.db")
+    ctx_pool = pool_mod.SessionPool(
+        client_factory=ctx_factory, idle_timeout=300, store=ctx_store
+    )
+    ctx_runner = runner_mod.Alkaid0Runner(
+        ctx_pool,
+        {"acp_url": "ws://plugin/acp", "context_count": 2},
+    )
+    ctx_key = "aiocqhttp:group:783"
+
+    async def _run_ctx_turn(event, prompt, *, count=2, max_chars=150):
+        await ctx_runner.reset(
+            request=SimpleNamespace(prompt=prompt),
+            run_context=SimpleNamespace(context=SimpleNamespace(event=event)),
+            agent_hooks=None,
+            provider_config={
+                "acp_url": "ws://panel/acp",
+                "context_count": count,
+                "context_max_chars": max_chars,
+            },
+            streaming=False,
+        )
+        return [response async for response in ctx_runner.step_until_done()]
+
+    await _run_ctx_turn(
+        FakeEvent(
+            group_id="783",
+            session_id="783",
+            umo=ctx_key,
+            sender_name="小明",
+            message_id="c-1",
+        ),
+        "第一条",
+    )
+    await _run_ctx_turn(
+        FakeEvent(
+            group_id="783",
+            session_id="783",
+            umo=ctx_key,
+            sender_name="小红",
+            message_id="c-2",
+        ),
+        "第二条",
+    )
+    ctx_calls = [
+        call for call in ctx_created[0].calls if call[0] == "session/prompt"
+    ]
+    ctx_text = ctx_calls[-1][1]["text"] if ctx_calls else ""
+    check(
+        "上下文感知：上一轮消息带进这一轮，当前消息留在最后",
+        ctx_text.startswith("[更早的群聊记录（仅供参考）]\n[小明] 第一条")
+        and "[/更早的群聊记录]" in ctx_text
+        and ctx_text.endswith("第二条"),
+        ctx_text,
+    )
+    check(
+        "上下文感知：历史落库并带上发言人",
+        [
+            (row["messageId"], row["speaker"])
+            for row in ctx_store.history_entries(ctx_key)
+        ]
+        == [("c-2", "小红"), ("c-1", "小明")],
+        str(ctx_store.history_entries(ctx_key)),
+    )
+
+    long_key = "aiocqhttp:group:784"
+    await _run_ctx_turn(
+        FakeEvent(
+            group_id="784",
+            session_id="784",
+            umo=long_key,
+            sender_name="小明",
+            message_id="l-1",
+        ),
+        "长" * 151,
+    )
+    await _run_ctx_turn(
+        FakeEvent(
+            group_id="784",
+            session_id="784",
+            umo=long_key,
+            sender_name="小明",
+            message_id="l-2",
+        ),
+        "短消息",
+    )
+    long_calls = [
+        call for call in ctx_created[-1].calls if call[0] == "session/prompt"
+    ]
+    long_text = long_calls[-1][1]["text"] if long_calls else ""
+    check(
+        "上下文感知：超过 k 字的旧消息不带",
+        long_text == "短消息",
+        long_text,
+    )
+    await ctx_pool.reset_session(ctx_key)
+    check(
+        "上下文感知：/areset 同时清空群聊历史",
+        ctx_store.history_entries(ctx_key) == [],
+        str(ctx_store.history_entries(ctx_key)),
+    )
+    await ctx_runner.close()
+    await ctx_pool.close_all()
+
+    # ── 服务端没声明 v0.7：不发图片，提示词里说明已忽略 ──
+    old_created = []
+
+    def old_factory(url, name):
+        client = FakeClient(url, name, updates=image_updates)
+        old_created.append(client)
+        return client
+
+    old_pool = pool_mod.SessionPool(client_factory=old_factory, idle_timeout=300)
+    old_runner = runner_mod.Alkaid0Runner(old_pool, {"acp_url": "ws://plugin/acp"})
+    old_event = FakeEvent(
+        group_id="780", session_id="780", umo="aiocqhttp:group:780"
+    )
+    await old_runner.reset(
+        request=SimpleNamespace(prompt="", image_urls=[_PNG_1PX_B64]),
+        run_context=SimpleNamespace(context=SimpleNamespace(event=old_event)),
+        agent_hooks=None,
+        provider_config={"acp_url": "ws://panel/acp"},
+        streaming=False,
+    )
+    old_responses = [response async for response in old_runner.step_until_done()]
+    old_calls = [call for call in old_created[0].calls if call[0] == "session/prompt"]
+    check(
+        "旧服务端（未声明 v0.7）不发图片，提示词里说明已忽略",
+        old_calls
+        and old_calls[-1][1].get("images", []) == []
+        and "图片已忽略" in old_calls[-1][1]["text"]
+        and old_responses[-1].type == "llm_result",
+        str(old_calls),
+    )
+    await old_runner.close()
+    await old_pool.close_all()
+
     # ── 自动批准：提示词标记 + requires_action 早于审批请求 ──
     auto_created = []
 
@@ -5276,7 +5918,7 @@ async def plugin_wakeup_checks():
             super().__init__(url, name)
             self.release = asyncio.Event()
 
-        async def session_prompt(self, session_id, text, timeout=None):
+        async def session_prompt(self, session_id, text, *, images=(), timeout=None):
             self.calls.append(
                 ("session/prompt", {"sessionId": session_id, "text": text})
             )
@@ -5462,6 +6104,8 @@ check(
         "show_thought",
         "at_parse_enable",
         "cq_parse_enable",
+        "context_count",
+        "context_max_chars",
         "auto_approve_enable",
         "auto_approve_tools",
         "auto_approve_prompt",
@@ -5497,6 +6141,8 @@ check(
         "show_thought",
         "at_parse_enable",
         "cq_parse_enable",
+        "context_count",
+        "context_max_chars",
         "auto_approve_enable",
         "auto_approve_tools",
         "auto_approve_prompt",
@@ -5561,6 +6207,19 @@ async def turn_queue_checks():
         == "（群里攒了 4 条消息，一起看一下）\n[张三] 帮我看看 A\n顺便看下 B\n[王五] 看一下 C",
         merged,
     )
+    with_images = turn_queue_mod.merge_prompt(
+        [
+            SimpleNamespace(label="张三", text="看图", image_refs=("a", "b")),
+            SimpleNamespace(label="李四", text="", image_refs=("c",)),
+            SimpleNamespace(label="王五", text="   "),
+        ]
+    )
+    check(
+        "merge_prompt：带图片的条目标注图片数，纯图片条目不会消失",
+        with_images
+        == "（群里攒了 3 条消息，一起看一下）\n[张三] 看图（附带 2 张图片）\n[李四] （附带 1 张图片）",
+        with_images,
+    )
     check(
         "发言名取昵称，取不到退到发言者 ID、再取不到就空",
         runner_mod.speaker_name(FakeEvent(sender_name="小明")) == "小明"
@@ -5592,6 +6251,21 @@ async def turn_queue_checks():
         str(queue.snapshot()),
     )
 
+    id_queue = turn_queue_mod.TurnQueue()
+    await id_queue.enter("group:id", "先", message_id="id-1")
+    id_waiter = asyncio.create_task(
+        id_queue.enter("group:id", "后", message_id="id-2")
+    )
+    await asyncio.sleep(0.01)
+    check(
+        "排队消息的 ID 可查（上下文计数时跳过用）",
+        id_queue.queued_message_ids("group:id") == ("id-2",),
+        str(id_queue.queued_message_ids("group:id")),
+    )
+    await id_queue.leave("group:id")
+    await id_waiter
+    await id_queue.leave("group:id")
+
     await queue.leave("group:a")
     slot_second, slot_third = await second, await third
     check(
@@ -5611,6 +6285,28 @@ async def turn_queue_checks():
         slot_third.action == turn_queue_mod.ACTION_ABSORBED and slot_third.text == "",
         str(slot_third),
     )
+
+    # ── 图片引用：开跑那条自己带着，攒批按排队顺序合并 ──
+    image_queue = turn_queue_mod.TurnQueue()
+    image_lead = await image_queue.enter(
+        "group:i", "带图", speaker="张三", image_refs=("a",)
+    )
+    image_waiter = asyncio.create_task(
+        image_queue.enter("group:i", "", speaker="李四", image_refs=("b", "c"))
+    )
+    await asyncio.sleep(0.01)
+    await image_queue.leave("group:i")
+    image_merged = await image_waiter
+    check(
+        "攒批把排队消息的图片引用按顺序合并（带队那条已经发过了）",
+        image_lead.action == turn_queue_mod.ACTION_RUN
+        and image_lead.image_refs == ("a",)
+        and image_merged.action == turn_queue_mod.ACTION_MERGED
+        and image_merged.image_refs == ("b", "c")
+        and "（附带 2 张图片）" in image_merged.text,
+        str(image_merged),
+    )
+    await image_queue.leave("group:i")
     check(
         "带队者接着跑，闸门还在它手里",
         queue.busy("group:a") and queue.waiting("group:a") == 0,
@@ -5743,7 +6439,7 @@ async def turn_queue_checks():
     class GatedClient(FakeClient):
         """提示词发出去后先卡住，等测试放行才回 idle：用来观察谁还拿着闸门。"""
 
-        async def session_prompt(self, session_id, text, timeout=None):
+        async def session_prompt(self, session_id, text, *, images=(), timeout=None):
             self.calls.append(
                 ("session/prompt", {"sessionId": session_id, "text": text})
             )

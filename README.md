@@ -3,7 +3,7 @@
 > AstrBot ↔ **Alkaid0 Coding Agent** 中继插件：把 AstrBot 的「Agent 执行器」接到 alkaid0 上，
 > 走 **ACP（Agent Client Protocol）v2 over WebSocket**。
 
-当前版本（v0.4.1）做了这些事：
+当前版本（v0.5.0）做了这些事：
 
 1. **注册执行器**：启动时用前置插件 librunner 注册名为 `alkaid0` 的执行器 ——
    在 WebUI「AI → Agent 执行方式」里选中它，群消息就交给 alkaid0 处理；
@@ -100,7 +100,22 @@
     `[CQ:at,qq=…]` / `[CQ:face,id=…]` / `[CQ:poke,…]` / `[CQ:dice]` /
     `[CQ:rps]` / `[CQ:shake]` 会变成对应的 AstrBot 组件；其它 CQ 码（image、
     json、xml、合并转发、mface 等）**直接删掉，不显示**。只有 OneBot
-    （`aiocqhttp`）平台会构造组件；其它平台只删除、不显示。`image` 以后再做。
+    （`aiocqhttp`）平台会构造组件；其它平台只删除、不显示。
+22. **收图片**：群里发的图片会随消息一起发给 alkaid0 —— 走 ACP `session/prompt`
+    的 `image` 内容块（`alk.cxykevin.top/alkaid0/v0.7` 能力，每轮最多 4 张）。
+    纯图片消息也能跑（服务端补 `[image]` 占位），图片引用支持消息附件的裸 base64、
+    `base64://`、`data:` URI 与本地路径；单张坏图只跳过、不挡文字。攒批时按消息
+    顺序合并图片。旧服务端没声明 `v0.7` 时只发文字，并在提示词里说明图片已忽略。
+23. **引用消息补上下文**：回复 / 引用一条更早的消息时，如果那条还没发给过本群会话
+    （每会话记最近 32 条已发送消息 ID，存在 SQLite 里），就把被引用消息的正文和图片
+    一起带进本轮提示词（`[引用消息｜昵称(QQ)] … [/引用消息]`）；已经发过的只发当前
+    消息，不重复带。图片走同一条 `image` 块通道，受每轮 4 张上限。连接空闲回收后
+    续接、AstrBot 重启后记录都还在；`/areset` 与 `/aresume` 换会话时清空。
+24. **上下文感知（可选）**：`context_count`（默认 0）设为 n 后，每轮从最近的群聊记录
+    往回带 n 条上文；`context_max_chars`（默认 150）控制单条最大字数，超长的跳过、不计数，
+    最多只往回遍历 2n 条。已经排进累计队列、稍后会随本批一起发出的消息不参与计数；本轮
+    真正要发送的消息不受字数限制。历史存在 SQLite 的 `message_history` 表（每群最多
+    512 条），`/areset` 会清空。两个开关同时支持插件配置与执行器面板。
 
 > [!NOTE]
 > 这一版的功能已经比较完整：ACP 传输（连接 / 握手 / 会话 / 提示词 / 通知 / 工具审批）、
@@ -190,6 +205,8 @@ astrbot_plugin_0528_v2/
 ├── at_parse.py        回复里的 `@昵称(QQ号)` / `@QQ号` / `@(QQ号)` → 真正的 OneBot at（仅 OneBot 群聊生效）
 ├── cq_parse.py        回复里的 CQ 码 → AstrBot 组件（at / face / poke / dice / rps / shake；其它删掉）
 ├── meme_bridge.py     与「表情包管理器」（meme_manager）联动：`&&分类键&&` 的清理、交棒与发图
+├── quote_message.py   引用 / 回复消息解析：被引用正文与图片 → 提示词上下文（未发给会话时才补）
+├── context_history.py 上下文感知：从群聊历史里挑 n 条上文（超长跳过、队列消息跳过）
 ├── proactive.py       常驻监听：把 cron / 其它客户端发起的回合（没有本地 prompt）主动推回群聊
 ├── wakeup_hook.py     HTTP 唤醒钩子：cron 唤醒时续接会话、等送达并转发回复；一键写入 alkaid0 钩子
 ├── panel.py           插件配置面板后端：配置树 / 类型校验 / 凭证脱敏与还原 / 保存
@@ -204,7 +221,7 @@ astrbot_plugin_0528_v2/
 │   ├── pool.py        群 → 连接的表 + 空闲回收 + 会话续接/重置 + 配置项/命令列表缓存 + 定时任务查询
 │   ├── approval.py    工具审批直通：授权解析 / 工具名匹配 / 自动回包 / 等待提示判定
 │   ├── commands.py    远端命令：能力标记、`availableCommands` 解析、与 alcoh 同步的文案对照表
-│   └── store.py       「群 → 会话 ID」「排队插话」「群 → 工作目录绑定」的 SQLite 记录（sessions.db）
+│   └── store.py       「群 → 会话 ID」「排队插话」「群 → 工作目录绑定」「已发送消息 ID」「消息正文历史」的 SQLite 记录（sessions.db）
 ├── turn_queue.py      群内闸门：一个群同时只跑一轮、插话排队攒批（排队顺手落库、启动时恢复）
 ├── prerequisite.py    前置插件管理（检测 / 安装 / 就地激活 / 落盘）
 ├── selftest.py        离线自测（隔离在临时 ASTRBOT_ROOT，不联网、不碰真实实例数据）
@@ -236,6 +253,8 @@ astrbot_plugin_0528_v2/
 | `show_thought` | bool | `false` | 是否把思考过程作为 reasoning 消息一起发出 |
 | `at_parse_enable` | bool | `false` | 是否把回复里的 `@昵称(QQ号)` / `@QQ号` / `@(QQ号)` 解析成真正的 at（只取号码，昵称不参与）。只在群聊、且上游是 OneBot（`aiocqhttp`）时生效；私聊与其它平台保持原文 |
 | `cq_parse_enable` | bool | `false` | 是否把回复里的 `[CQ:at,qq=…]` / `[CQ:face,id=…]` / `[CQ:poke,…]` / `[CQ:dice]` / `[CQ:rps]` / `[CQ:shake]` 解析成组件；其它 CQ 码直接删掉、不显示。只有 OneBot（`aiocqhttp`）平台会构造组件，其它平台只删除 |
+| `context_count` | int | `0` | 上下文感知：每轮额外携带 n 条更早的群聊消息作为上文；`0` 表示关闭。已排在累计队列、稍后会随本批一起发出的消息不参与计数 |
+| `context_max_chars` | int | `150` | 上下文感知：单条旧消息超过 k 字就跳过、不计数；最多只往回遍历 2n 条。本轮真正要发送的消息不受此限制 |
 | `auto_approve_enable` | bool | `false` | 工具审批直通总开关；关闭时所有审批都挂起等 `/aapprove` |
 | `auto_approve_tools` | 字符串 | 空 | 自动批准的工具白名单（逗号 / 空格分隔，大小写不敏感，支持 `*` / `?`；单独 `*` 表示全部） |
 | `auto_approve_prompt` | bool | `true` | 是否允许本轮消息里的 `[auto_approve: read, edit]` 临时授权（只对本轮生效，标记会从提示词删掉） |
@@ -346,6 +365,9 @@ result = await wake(
 # 群内闸门与排队落库（攒批提示词 / 静默收尾 / 取消摘队 / 落库往返 / 启动恢复 / 坏库降级）、
 # 工作目录（模板根 / 相对路径校验 / 绑定解析 / 自动建目录重试）、
 # 请求注入（provider_settings / 消息开头的 / 会被去掉）、
+# 图片输入（裸 base64 / data URI → image 块、每轮上限 4 张、纯图片消息、攒批合并、v0.7 能力判断）、
+# 引用消息（未发过的正文 + 图片补进提示词、已发过的跳过、消息 ID 去重与 32 条上限、重置清空）、
+# 上下文感知（历史落库与裁剪、n/k 规则、队列消息跳过、2n 遍历上限、端到端拼提示词、/areset 清空）、
 # 工具审批（默认挂起 / 审批提示 / /aapprove 回包与失效；直通的授权解析、白名单 /
 # 提示词标记 / 外部钩子、自动回包与「不发等待提示」、外部授权 TTL）、
 # 配置面板（字段树 / 类型校验 / 凭证脱敏与还原 / 保存回滚 / 路由注册 / i18n 完整性）、
@@ -378,7 +400,7 @@ uv run ruff check data/plugins/astrbot_plugin_0528_v2/
 | 聊天里 `/actx` | 本群会话的上下文用量，一行 `context 1% (11801/1024000)`；还没跑过一轮 / 刚 `/areset` / 刚被回收重连时如实说明「没有可报的用量」 |
 | 聊天里 `/librunner` | librunner 侧状态（补丁是否生效、已注册的驱动器列表里应出现 `alkaid0`） |
 | 日志 `grep 0528v2` | `ACP 连接池已启动`、`已注册执行器 alkaid0`、`已建立 ACP 会话`、`已续接 ACP 会话`、`已回收群 … 的连接`、`群 … 正在跑一轮，…的插话先排队（当前 N 条）`、`群 … 上一轮结束，把 N 条插话攒成一批接着跑（…）`、`群 … 这条消息已并进当前这一批里，不单独回话`、`从库里恢复 N 条排队插话`、`/areset 重置群 …`、`把群 … 的 model / thought_level 切成 …`、`/aresume 把群 … 的会话切到 …`、`/acmd 在群 … 执行了 …`、`命令 /compress 结束（stopReason=…）`、`/astop 已请求群 … 中止当前轮（会话 …）`、`/actx 群 … 上报用量 context …`、`/acron 已删除群 … 的定时任务 …` |
-| `data/plugin_data/astrbot_plugin_0528_v2/sessions.db` | 每个群记着的 ACP 会话 ID（表 `group_sessions`：`conv_key` / `session_id` / `cwd` / `updated_at`）、**排着队的插话**（表 `turn_queue`：`conv_key` / `label` / `text` / `created_at`）与**工作目录绑定**（表 `conv_workdirs`：`conv_key` / `rel` / `updated_at`） |
+| `data/plugin_data/astrbot_plugin_0528_v2/sessions.db` | 每个群记着的 ACP 会话 ID（表 `group_sessions`：`conv_key` / `session_id` / `cwd` / `updated_at`）、**排着队的插话**（表 `turn_queue`：`conv_key` / `label` / `text` / `created_at`）、**工作目录绑定**（表 `conv_workdirs`：`conv_key` / `rel` / `updated_at`）、**已发送消息 ID**（表 `sent_messages`：`conv_key` / `message_id` / `created_at`，每会话最多 32 条）与**消息正文历史**（表 `message_history`：`conv_key` / `message_id` / `speaker` / `text` / `image_count` / `created_at`，每会话最多 512 条） |
 | `data/plugin_data/astrbot_plugin_0528_v2/prerequisite.json` | 每次自动安装的结果（`attempts` / `message` / `activated`） |
 
 ---
@@ -467,9 +489,20 @@ uv run ruff check data/plugins/astrbot_plugin_0528_v2/
   发起的主动回合还没接**（`proactive.py` 与唤醒钩子 relay 走的是另一条发送路径），
   那两条路上的标记会原样发到群里；
 - **CQ 码解析只覆盖「本地回合」的回复**：只做 at / face / poke / dice / rps / shake；
-  其它 CQ 码（包括 image、json、xml、合并转发、mface）在开关打开时**直接删掉、不显示**，
-  image 以后再做。非 OneBot 平台只删除、不构造组件；`/acmd` 与主动推送（cron）的回复
-  还没接这条解析。
+  其它 CQ 码（包括 image、json、xml、合并转发、mface）在开关打开时**直接删掉、不显示**
+  （用户发来的图片走第 22 条单独发给 alkaid0，这里说的是回复里的 CQ image 码）。
+  非 OneBot 平台只删除、不构造组件；`/acmd` 与主动推送（cron）的回复还没接这条解析；
+- **图片输入只覆盖「本地回合」**：群消息里的图片随 `session/prompt` 的 image 块发出，
+  每轮最多 4 张（alkaid0 服务端限制，超出部分只记警告并丢弃）；纯图片消息也能跑。
+  排队攒批时图片引用在内存里合并，**重启后从库里恢复的插话只剩文字占位**（图片本身
+  没落库）；`/acmd` 命令轮与 cron / 其它客户端发起的外部回合没有本地用户图片。
+- **上下文感知按群记录，且只在开启时记录**：`context_count > 0` 时收到的消息才进
+  `message_history`，所以刚打开时没有更早的历史；`/acmd` 命令轮与主动推送不是本地回合，
+  不会记。记录按群键共享，`/aresume` 换会话不清空，`/areset` 会清空。
+- **引用消息只在本地回合补**：`/acmd` 命令轮、cron / 其它客户端发起的外部回合没有
+  本地消息事件，不会补引用。只回看每会话最近 32 条已发送 ID，更早的引用会当成
+  「没发过」再带一次；引用里的图片同样不落库（排队插话重启恢复后只剩引用文字）。
+  「已发送」按消息 ID 记，引用机器人自己发过的回复不在记录里，因此会再带一次。
 - **配置面板只编辑标量字段**：`_conf_schema.json` 里的 `bool` / `string` / `int` /
   `float` / `text` 会出现在面板里；`list` / `object` / `template_list` 等复杂类型仍走
   原生配置页。ACP 地址 / 仓库地址里的凭证显示为 `***`，保存时按字段名还原；

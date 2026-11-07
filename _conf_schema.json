@@ -65,6 +65,18 @@
         "default": false,
         "hint": "开启后，回复里的 [CQ:at,qq=…] / [CQ:face,id=…] / [CQ:poke,…] / [CQ:dice] / [CQ:rps] / [CQ:shake] 会解析成对应组件；其它 CQ 码直接删掉，不在聊天里显示。只有 OneBot（aiocqhttp）平台会构造组件，其它平台只删除、不显示。以执行器面板为准。"
     },
+    "context_count": {
+        "description": "上下文感知：每轮携带的上文条数",
+        "type": "int",
+        "default": 0,
+        "hint": "从最近的群聊记录往回数，每轮额外带上 n 条上文；0 表示关闭。已经排进累计队列、稍后会随本批一起发出的消息不参与计数。以执行器面板为准。"
+    },
+    "context_max_chars": {
+        "description": "上下文感知：单条消息最大字数",
+        "type": "int",
+        "default": 150,
+        "hint": "超过 k 字的旧消息跳过、不计入 n 条（最多只往回遍历 2n 条）；本轮真正要发送的消息不受此限制。以执行器面板为准。"
+    },
     "auto_approve_enable": {
         "description": "启用工具审批直通（Auto-Approve）",
         "type": "bool",

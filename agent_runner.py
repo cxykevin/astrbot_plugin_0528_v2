@@ -33,8 +33,9 @@ from astrbot.core.agent.runners.base import AgentState, BaseAgentRunner
 from astrbot.core.astr_agent_context import AstrAgentContext
 from astrbot.core.message.message_event_result import MessageChain
 from astrbot.core.provider.entities import LLMResponse, ProviderRequest
+from astrbot.core.utils.media_utils import resolve_image_ref_to_base64_data
 
-from . import at_parse, cq_parse, meme_bridge
+from . import at_parse, context_history, cq_parse, meme_bridge, quote_message
 from .acp import ACPConnectionError, ACPError, GroupSession, SessionPool
 from .acp import approval as approval_mod
 from .acp import protocol as acp
@@ -83,6 +84,8 @@ RUNNER_CONFIG_DEFAULT: dict[str, T.Any] = {
     "show_thought": False,
     "at_parse_enable": False,
     "cq_parse_enable": False,
+    "context_count": 0,
+    "context_max_chars": 150,
     "auto_approve_enable": False,
     "auto_approve_tools": "",
     "auto_approve_prompt": True,
@@ -144,6 +147,22 @@ RUNNER_CONFIG_METADATA: dict[str, T.Any] = {
             "[CQ:dice] / [CQ:rps] / [CQ:shake] 解析成组件；其它 CQ 码直接删掉，"
             "不在聊天里显示。只有 OneBot（aiocqhttp）平台会构造组件，"
             "其它平台只删除、不显示。"
+        ),
+    },
+    "context_count": {
+        "description": "上下文感知：每轮携带的上文条数",
+        "type": "int",
+        "hint": (
+            "从最近的群聊记录往回数，每轮额外带上 n 条上文；0 表示关闭。"
+            "已经排进累计队列、稍后会随本批一起发出的消息不参与计数。"
+        ),
+    },
+    "context_max_chars": {
+        "description": "上下文感知：单条消息最大字数",
+        "type": "int",
+        "hint": (
+            "超过 k 字的旧消息跳过、不计入 n 条（最多只往回遍历 2n 条）。"
+            "本轮真正要发送的消息不受此限制。"
         ),
     },
     "auto_approve_enable": {
@@ -215,6 +234,25 @@ def _as_float(value: T.Any, default: float) -> float:
     return default
 
 
+def _as_int(value: T.Any, default: int) -> int:
+    """把配置值转成整数，转换不了就用默认值。"""
+    if isinstance(value, bool):
+        return default
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float):
+        return int(value)
+    if isinstance(value, str):
+        try:
+            return int(value.strip())
+        except ValueError:
+            try:
+                return int(float(value.strip()))
+            except ValueError:
+                return default
+    return default
+
+
 def _pick(
     provider_config: T.Any,
     plugin_config: T.Any,
@@ -251,6 +289,8 @@ class RunnerSettings:
         show_thought: 是否把思考过程也作为 reasoning 消息发出。
         at_parse_enable: 是否把回复里的 ``@昵称(QQ号)`` 等写法解析成真正的 at。
         cq_parse_enable: 是否把回复里的 CQ 码解析成组件（不支持的 CQ 码直接删掉）。
+        context_count: 每轮额外携带几条更早的群聊消息作为上文（``0`` 表示关闭）。
+        context_max_chars: 上下文里单条消息的最大字数（更长的跳过、不计数）。
         auto_approve_enable: 工具审批直通总开关。
         auto_approve_tools: 自动批准的工具白名单（逗号 / 空格分隔，支持通配）。
         auto_approve_prompt: 是否允许提示词里的 ``[auto_approve: ...]`` 临时授权。
@@ -265,6 +305,8 @@ class RunnerSettings:
     show_thought: bool = False
     at_parse_enable: bool = False
     cq_parse_enable: bool = False
+    context_count: int = 0
+    context_max_chars: int = 150
     auto_approve_enable: bool = False
     auto_approve_tools: str = ""
     auto_approve_prompt: bool = True
@@ -305,6 +347,20 @@ class RunnerSettings:
             ),
             cq_parse_enable=_as_bool(
                 _pick(provider_config, plugin_config, "cq_parse_enable"), False
+            ),
+            context_count=max(
+                0,
+                _as_int(
+                    _pick(provider_config, plugin_config, "context_count"),
+                    0,
+                ),
+            ),
+            context_max_chars=max(
+                0,
+                _as_int(
+                    _pick(provider_config, plugin_config, "context_max_chars"),
+                    150,
+                ),
             ),
             auto_approve_enable=_as_bool(
                 _pick(provider_config, plugin_config, "auto_approve_enable"), False
@@ -478,6 +534,53 @@ def speaker_name(event: T.Any) -> str:
 def sender_id(event: T.Any) -> str:
     """发言者的 ID（注入 ``[Reminder: @昵称(id)]`` 用）；取不到就退到会话号。"""
     return _call_str(event, "get_sender_id") or _call_str(event, "get_session_id")
+
+
+# ── 图片输入（alkaid0 扩展文档 §4.3）────────────────────────────────────
+def image_refs_of(request: T.Any) -> tuple[str, ...]:
+    """把请求里的图片引用洗成非空字符串元组（纯函数，便于自测）。
+
+    AstrBot 的 ``ProviderRequest.image_urls`` 可能是裸 base64（消息附件）、
+    ``base64://`` / ``data:`` URI、本地路径或 HTTP URL；这里只做去空与类型过滤，
+    真正解析交给 :func:`resolve_prompt_images`。
+    """
+    refs = getattr(request, "image_urls", None)
+    if not isinstance(refs, (list, tuple)):
+        return ()
+    return tuple(ref.strip() for ref in refs if isinstance(ref, str) and ref.strip())
+
+
+async def resolve_prompt_images(
+    refs: T.Iterable[str], *, limit: int = acp.MAX_PROMPT_IMAGES
+) -> list[dict]:
+    """把 AstrBot 的图片引用解析成 ACP ``image`` 内容块（最多 ``limit`` 张）。
+
+    统一交给 AstrBot 的媒体工具取出字节并识别 MIME；单张失败只记警告并跳过，
+    不挡住这一轮的文字与其它图片。
+    """
+    images: list[dict] = []
+    for ref in refs:
+        if len(images) >= limit:
+            break
+        if not isinstance(ref, str) or not ref.strip():
+            continue
+        try:
+            resolved = await resolve_image_ref_to_base64_data(ref.strip())
+        except Exception as exc:  # noqa: BLE001 - 单张坏图不该毁掉整条消息
+            logger.warning(
+                "%s: 读取图片失败（引用长度 %d），已跳过：%s",
+                LOG_PREFIX,
+                len(ref),
+                exc,
+            )
+            continue
+        if resolved is None:
+            logger.warning(
+                "%s: 图片无法解析（引用长度 %d），已跳过", LOG_PREFIX, len(ref)
+            )
+            continue
+        images.append(acp.image_block(resolved.base64_data, resolved.mime_type))
+    return images
 
 
 # ── 请求注入（AstrBot 的 provider_settings）─────────────────────────────
@@ -1028,21 +1131,52 @@ class Alkaid0Runner(BaseAgentRunner[AstrAgentContext]):
         self._transition_state(AgentState.RUNNING)
         await self._announce_begin()
 
-        # 发到 alkaid0 之前去掉消息开头的斜杠：否则会被当成远端斜杠命令
-        # （``/hello`` → ``hello``；``/acmd`` 走的命令通道不经过这里）。
-        prompt_text = strip_leading_slash(getattr(self.request, "prompt", "") or "")
         event = self._event()
-        if not prompt_text:
-            async for response in self._fail("提示词为空，没有内容可以发给 Alkaid0"):
-                yield response
-            return
         if event is None:
             async for response in self._fail("拿不到消息事件（run_context 不完整）"):
                 yield response
             return
 
+        # 发到 alkaid0 之前去掉消息开头的斜杠：否则会被当成远端斜杠命令
+        # （``/hello`` → ``hello``；``/acmd`` 走的命令通道不经过这里）。
+        prompt_text = strip_leading_slash(getattr(self.request, "prompt", "") or "")
+        image_refs = image_refs_of(self.request)
         key = object_key(event)
         cwd = self._cwd_for(key, event)
+
+        # 上下文感知：先把这条消息记进历史（本轮不带它自己，后面按 message_ids 排除）。
+        # 只记「真正的用户消息」，引用补进来的旧内容不重复记。
+        if self._settings.context_count > 0:
+            self._pool.remember_history(
+                key,
+                message_id=quote_message.message_id_of(event),
+                speaker=speaker_name(event),
+                text=prompt_text,
+                image_count=len(image_refs),
+            )
+
+        # 引用了更早的消息、而那条还没发给过这个会话：把引用内容（含图片）带上。
+        quote_text, quote_images = quote_message.quote_context(
+            event, was_sent=lambda mid: self._pool.was_message_sent(key, mid)
+        )
+        if quote_text:
+            prompt_text = f"{quote_text}\n\n{prompt_text}" if prompt_text else quote_text
+            logger.info(
+                "%s: 群 %s 带上了引用消息（%d 字、%d 张图）",
+                LOG_PREFIX,
+                key,
+                len(quote_text),
+                len(quote_images),
+            )
+        if quote_images:
+            image_refs = image_refs + quote_images
+
+        if not prompt_text and not image_refs:
+            async for response in self._fail(
+                "提示词为空，也没有图片可以发给 Alkaid0"
+            ):
+                yield response
+            return
 
         # 群内闸门：一个群同时只跑一轮；这一轮期间别人插的话先排队，结束后攒成一批
         slot = await self._turn_queue.enter(
@@ -1050,6 +1184,8 @@ class Alkaid0Runner(BaseAgentRunner[AstrAgentContext]):
             prompt_text,
             speaker=speaker_name(event),
             sender_id=sender_id(event),
+            image_refs=image_refs,
+            message_id=quote_message.message_id_of(event),
         )
         if slot.action == ACTION_ABSORBED:
             # 这一条已经并进别人那一批了：不占远端、也不回话。
@@ -1123,21 +1259,67 @@ class Alkaid0Runner(BaseAgentRunner[AstrAgentContext]):
         """按 ``provider_settings`` 给这一轮的提示词加前缀与系统提醒。
 
         读配置 / 拉群名失败都不该挡住消息（照老版 0528：注入是锦上添花）。
+        上下文感知块拼在最前面：它是更早的群聊记录，不属于当前这条消息。
         """
+        text = slot.text
         try:
             config = self._settings_provider()
         except Exception as exc:  # noqa: BLE001 - 注入失败照常发原话
             logger.warning("%s: 读取 provider_settings 失败：%s", LOG_PREFIX, exc)
-            return slot.text
-        if not config:
-            return slot.text
-        senders = slot.senders or ((speaker_name(event), sender_id(event)),)
-        group_name = ""
-        if _as_bool(config.get("group_name_display"), False):
-            group_name = await resolve_group_name(event)
-        return apply_prompt_settings(
-            slot.text, config, senders=senders, group_name=group_name
+            config = None
+        if config:
+            senders = slot.senders or ((speaker_name(event), sender_id(event)),)
+            group_name = ""
+            if _as_bool(config.get("group_name_display"), False):
+                group_name = await resolve_group_name(event)
+            text = apply_prompt_settings(
+                text, config, senders=senders, group_name=group_name
+            )
+
+        block = self._context_block(slot, event)
+        if block:
+            text = f"{block}\n\n{text}" if text else block
+        return text
+
+    def _context_block(self, slot: TurnSlot, event: T.Any) -> str:
+        """按配置挑出这一轮要带的更早群聊记录（关闭 / 没有历史时返回空串）。"""
+        count = self._settings.context_count
+        if count <= 0:
+            return ""
+        key = object_key(event)
+        try:
+            rows = self._pool.history_entries(key, limit=max(1, count * 2))
+        except Exception as exc:  # noqa: BLE001 - 读历史失败不该挡住消息
+            logger.warning("%s: 群 %s 读取上下文历史失败：%s", LOG_PREFIX, key, exc)
+            return ""
+        if not rows:
+            return ""
+        messages = [
+            context_history.ContextMessage(
+                message_id=str(row.get("messageId") or ""),
+                speaker=str(row.get("speaker") or ""),
+                text=str(row.get("text") or ""),
+                image_count=int(row.get("imageCount") or 0),
+            )
+            for row in rows
+        ]
+        picked = context_history.select_context(
+            messages,
+            limit=count,
+            max_chars=self._settings.context_max_chars,
+            exclude_ids=slot.message_ids,
+            queued_ids=self._turn_queue.queued_message_ids(key),
         )
+        block = context_history.render_context(picked)
+        if block:
+            logger.info(
+                "%s: 群 %s 这一轮带了 %d 条上下文（%d 字）",
+                LOG_PREFIX,
+                key,
+                len(picked),
+                len(block),
+            )
+        return block
 
     async def _run_gated(
         self, slot: TurnSlot, key: str, cwd: str, event: T.Any
@@ -1165,7 +1347,13 @@ class Alkaid0Runner(BaseAgentRunner[AstrAgentContext]):
 
         try:
             async with session.lock:
-                async for response in self._run_turn(session, prompt_text, event):
+                async for response in self._run_turn(
+                    session,
+                    prompt_text,
+                    event,
+                    image_refs=slot.image_refs,
+                    message_ids=slot.message_ids,
+                ):
                     yield response
         except Exception as exc:  # noqa: BLE001 - 执行期问题同样上报
             logger.error(
@@ -1193,9 +1381,20 @@ class Alkaid0Runner(BaseAgentRunner[AstrAgentContext]):
         await self._announce_done()
 
     async def _run_turn(
-        self, session: GroupSession, prompt_text: str, event: T.Any
+        self,
+        session: GroupSession,
+        prompt_text: str,
+        event: T.Any,
+        *,
+        image_refs: T.Sequence[str] = (),
+        message_ids: T.Sequence[str] = (),
     ) -> AsyncGenerator[AgentResponse, None]:
         """提交提示词并消费通知，直到本轮 ``state_update idle``。
+
+        图片（``image_refs``，来自 ``ProviderRequest.image_urls``）会先解析成 ACP
+        image 块随 ``session/prompt`` 一起发出；服务端未声明 v0.7 图片能力时只发文字，
+        并在提示词里说明图片已被忽略。``message_ids`` 是这一批消息的 ID，发送成功后
+        记进「已发送」表，供下一条引用消息判断要不要重复带内容。
 
         表情包管理器（``meme_manager``）装了并启用着时，这一轮的正文会先交给它处理：
         流式增量里先把 ``&&分类键&&`` 挡掉，收尾时再用它返回的干净正文和选好的图片
@@ -1276,7 +1475,37 @@ class Alkaid0Runner(BaseAgentRunner[AstrAgentContext]):
             enabled=settings.auto_approve_enable and settings.auto_approve_prompt,
         )
         session.set_prompt_grant(prompt_grant)
-        if not prompt_text:
+
+        # 图片：引用先解析成 ACP image 块；服务端没声明 v0.7 就不发图，只在文字里说明。
+        images = await resolve_prompt_images(image_refs)
+        image_error = ""
+        if image_refs and not images:
+            image_error = "图片读取失败"
+            logger.warning(
+                "%s: 群 %s 的 %d 张图片都没能读取，按纯文字处理",
+                LOG_PREFIX,
+                session.key,
+                len(image_refs),
+            )
+            if prompt_text:
+                prompt_text = f"{prompt_text}\n（图片读取失败，已忽略）"
+        if images and not session.supports_prompt_images:
+            image_error = "当前 Alkaid0 服务端不支持图片输入（未声明 v0.7 能力）"
+            logger.warning(
+                "%s: 群 %s 的服务端未声明图片能力，%d 张图片不发送",
+                LOG_PREFIX,
+                session.key,
+                len(images),
+            )
+            images = []
+            note = f"（{image_error}，图片已忽略）"
+            prompt_text = f"{prompt_text}\n{note}" if prompt_text else note
+
+        if not prompt_text and not images:
+            if image_error:
+                async for response in self._fail(image_error):
+                    yield response
+                return
             # 只写了授权标记：不能把空提示词发给 alkaid0；给一句无害的继续语。
             prompt_text = "继续"
 
@@ -1294,13 +1523,20 @@ class Alkaid0Runner(BaseAgentRunner[AstrAgentContext]):
             if callable(clear_deferred):
                 clear_deferred()
             await session.client.session_prompt(
-                session.session_id, prompt_text, timeout=settings.turn_timeout_sec
+                session.session_id,
+                prompt_text,
+                images=images,
+                timeout=settings.turn_timeout_sec,
             )
+            # 真的发出去了才记账：下一条消息引用它时就不必重复带内容。
+            if message_ids:
+                self._pool.remember_sent(session.key, message_ids)
             logger.info(
-                "%s: 群 %s 已提交 prompt（%d 字），等待 Alkaid0 响应",
+                "%s: 群 %s 已提交 prompt（%d 字、%d 张图片），等待 Alkaid0 响应",
                 LOG_PREFIX,
                 session.key,
                 len(prompt_text),
+                len(images),
             )
 
             while True:

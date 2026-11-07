@@ -23,6 +23,7 @@ import asyncio
 import contextlib
 import time
 import typing as T
+from collections import deque
 from dataclasses import dataclass, field
 
 from astrbot.api import logger
@@ -30,7 +31,7 @@ from astrbot.api import logger
 from . import commands as acp_commands
 from . import protocol as acp
 from .client import ACPClient, ACPError
-from .store import SessionStore
+from .store import SENT_MESSAGE_LIMIT, SessionStore
 
 #: 没有配置空闲时间时的默认值（秒）。
 DEFAULT_IDLE_TIMEOUT_SEC = 1800.0
@@ -113,6 +114,12 @@ class GroupSession:
     available_commands: list[dict] = field(default_factory=list)
     #: 最近一次 ``usage_update`` 的上下文用量 ``(used, size)``；还没收到时是 None。
     usage: tuple[int, int] | None = None
+    #: 最近发过的消息 ID（引用消息时判断「这条是不是已经给它看过」），最多 32 条。
+    sent_ids: deque[str] = field(
+        default_factory=lambda: deque(maxlen=SENT_MESSAGE_LIMIT)
+    )
+    #: 是否已经从记录表里捞过 ``sent_ids``（新会话会直接标记为已加载）。
+    _sent_loaded: bool = field(default=False, repr=False)
     #: 本轮提示词里带的自动批准授权（只在本轮有效，回合结束清掉）。
     prompt_grant: T.Any = None
     #: 外部钩子（cron 唤醒等）带来的自动批准授权（带过期时间）。
@@ -160,6 +167,43 @@ class GroupSession:
         """标记「刚刚有活动」，重置空闲计时。"""
         self.last_active = time.monotonic()
 
+    # ── 已发送消息（引用消息去重）─────────────────────────
+    def _load_sent_ids(self) -> None:
+        """第一次用时从记录表里捞回本会话最近发过的消息 ID（幂等）。"""
+        if self._sent_loaded:
+            return
+        self._sent_loaded = True
+        if self.store is None:
+            return
+        self.sent_ids = deque(
+            self.store.sent_message_ids(self.key), maxlen=SENT_MESSAGE_LIMIT
+        )
+
+    def was_message_sent(self, message_id: str) -> bool:
+        """这条消息之前是否已经发给过本会话。"""
+        mid = str(message_id or "").strip()
+        if not mid:
+            return False
+        self._load_sent_ids()
+        return mid in self.sent_ids
+
+    def remember_sent(self, message_ids: T.Iterable[str | int]) -> None:
+        """记下本轮真正发出去的消息 ID（内存 + 记录表，最多留 32 条）。"""
+        self._load_sent_ids()
+        wanted = [str(item).strip() for item in message_ids if str(item).strip()]
+        if not wanted:
+            return
+        self.sent_ids.extend(wanted)
+        if self.store is not None:
+            self.store.remember_sent(self.key, wanted)
+
+    def forget_sent(self) -> None:
+        """清空已发送记录（新会话 / 换会话 / ``/areset``）。"""
+        self.sent_ids.clear()
+        self._sent_loaded = True
+        if self.store is not None:
+            self.store.forget_sent(self.key)
+
     # ── 会话级配置项（模型 / 推理强度）─────────────────────
     def config_option(self, config_id: str) -> dict | None:
         """按 ``configId`` 取本会话的配置项（可选模型列表在 ``model`` 里）。"""
@@ -179,6 +223,18 @@ class GroupSession:
         return acp_commands.has_capability(
             getattr(self.client, "server_info", None),
             acp_commands.CAPABILITY_ALKAID0_V04,
+        )
+
+    @property
+    def supports_prompt_images(self) -> bool:
+        """服务端是否声明了 prompt 图片能力（``alk.cxykevin.top/alkaid0/v0.7``）。
+
+        扩展文档 §4.3：v0.7 表示 ``session/prompt`` 接受 image 内容块；未声明的旧
+        服务端只会解析文本块，纯图片消息还会直接报错，所以图片要在发送前先问一句。
+        """
+        return acp_commands.has_capability(
+            getattr(self.client, "server_info", None),
+            acp_commands.CAPABILITY_ALKAID0_V07,
         )
 
     @property
@@ -487,6 +543,7 @@ class GroupSession:
         # 换了（续接了）会话：旧的用量不属于它
         self.usage = None
         self._remember_config_options(result)
+        self._load_sent_ids()
         self.touch()
         logger.info(
             "%s: 群 %s 已唤醒 ACP 会话 %s（工作目录 %s，不回放历史）",
@@ -520,6 +577,7 @@ class GroupSession:
                     self.store.forget(self.key)
             else:
                 self._remember_config_options(resumed)
+                self._load_sent_ids()
                 logger.info(
                     "%s: 群 %s 已续接 ACP 会话 %s（工作目录 %s，不回放历史）",
                     LOG_PREFIX,
@@ -548,8 +606,9 @@ class GroupSession:
         if not session_id:
             raise ACPError(f"{self.key}：session/new 没有返回 sessionId（{result!r}）")
         session_id = str(session_id)
-        # 新会话：旧的用量作废（服务端开会话不推 usage，留着会张冠李戴）
+        # 新会话：旧的用量与已发送记录都作废
         self.usage = None
+        self.forget_sent()
         self._remember_config_options(result)
         if self.store is not None:
             self.store.remember(self.key, session_id, self.cwd)
@@ -623,8 +682,9 @@ class GroupSession:
         self.session_id = None
         result = await self.client.session_resume(session_id, self.cwd)
         self.session_id = session_id
-        # 换了会话：旧的用量不属于它
+        # 换了会话：旧的用量与已发送记录都不属于它
         self.usage = None
+        self.forget_sent()
         self._remember_config_options(result)
         if self.store is not None:
             self.store.remember(self.key, session_id, self.cwd)
@@ -679,6 +739,63 @@ class SessionPool:
     def peek(self, key: str) -> GroupSession | None:
         """看看某个群是否已有连接（不建立、不续期）。"""
         return self._sessions.get(key)
+
+    # ── 已发送消息（引用消息去重）─────────────────────────
+    def was_message_sent(self, key: str, message_id: str) -> bool:
+        """这条消息之前是否已经发给过该群的会话。
+
+        有活连接就查它的内存记录；连接被回收了就查记录表 —— 这样续接同一个会话
+        之后仍然认得上一次发过的消息。
+        """
+        mid = str(message_id or "").strip()
+        if not mid:
+            return False
+        session = self._sessions.get(key)
+        if session is not None:
+            return session.was_message_sent(mid)
+        if self._store is None:
+            return False
+        return mid in set(self._store.sent_message_ids(key))
+
+    def remember_sent(
+        self, key: str, message_ids: T.Iterable[str | int]
+    ) -> None:
+        """记下这一轮真正发出去的消息 ID（优先走活连接，顺带落库）。"""
+        wanted = [str(item).strip() for item in message_ids if str(item).strip()]
+        if not wanted:
+            return
+        session = self._sessions.get(key)
+        if session is not None:
+            session.remember_sent(wanted)
+        elif self._store is not None:
+            self._store.remember_sent(key, wanted)
+
+    # ── 消息正文历史（上下文感知）────────────────────────
+    def remember_history(
+        self,
+        key: str,
+        *,
+        message_id: str = "",
+        speaker: str = "",
+        text: str = "",
+        image_count: int = 0,
+    ) -> None:
+        """记下一条收到的消息正文（每会话只留最近若干条；没库时什么也不做）。"""
+        if self._store is None:
+            return
+        self._store.add_history(
+            key,
+            message_id=message_id,
+            speaker=speaker,
+            text=text,
+            image_count=image_count,
+        )
+
+    def history_entries(self, key: str, *, limit: int) -> list[dict]:
+        """该会话最近的消息正文（新的在前）；没库 / 读失败时返回空列表。"""
+        if self._store is None:
+            return []
+        return self._store.history_entries(key, limit=limit)
 
     def snapshot(self) -> list[dict]:
         """当前所有连接的状态快照（供状态命令 / 日志使用）。"""
@@ -862,6 +979,9 @@ class SessionPool:
         forgotten = (
             self._store.forget(key) if self._store is not None else False
         )
+        if self._store is not None:
+            self._store.forget_sent(key)
+            self._store.forget_history(key)
         async with self._lock:
             session = self._sessions.pop(key, None)
         if session is None:

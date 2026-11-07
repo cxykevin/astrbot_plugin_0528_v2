@@ -103,8 +103,15 @@ GROUP_SPECS: tuple[tuple[str, str, str, tuple[str, ...]], ...] = (
     (
         "chat",
         "聊天回显",
-        "控制工具调用等过程消息、思考过程与 at / CQ 码解析是否发到群里。",
-        ("echo_events", "show_thought", "at_parse_enable", "cq_parse_enable"),
+        "控制过程消息、思考过程、at / CQ 码解析与上下文感知是否生效。",
+        (
+            "echo_events",
+            "show_thought",
+            "at_parse_enable",
+            "cq_parse_enable",
+            "context_count",
+            "context_max_chars",
+        ),
     ),
     (
         "auto_approve",

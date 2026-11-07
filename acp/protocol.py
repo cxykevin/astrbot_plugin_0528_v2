@@ -16,6 +16,7 @@
 from __future__ import annotations
 
 import json
+from collections.abc import Mapping, Sequence
 from typing import Any
 
 #: ACP 协议版本。alkaid0 只接受 2（其他版本在 ``initialize`` 里报错）。
@@ -127,14 +128,53 @@ ERROR_INTERNAL = -32603
 ERROR_SERVER = -32099
 
 
+# ── ContentBlock（session/prompt 的 prompt 数组）────────────────────────
+#: 单条 prompt 最多携带的图片数（alkaid0 扩展文档 §4.3；服务端超过会直接报错）。
+MAX_PROMPT_IMAGES = 4
+
+
 def text_block(text: str) -> dict[str, Any]:
     """构造一个文本 ContentBlock。"""
     return {"type": "text", "text": text}
 
 
-def prompt_blocks(text: str) -> list[dict[str, Any]]:
-    """把一段文本包成 ``session/prompt`` 的 ``prompt`` 数组。"""
-    return [text_block(text)]
+def image_block(data: str, mime_type: str = "image/png") -> dict[str, Any]:
+    """构造一个 ACP ``image`` ContentBlock（alkaid0 扩展文档 §4.3）。
+
+    Args:
+        data: 图片字节的 base64（不带 ``base64://`` / ``data:`` 前缀）。
+        mime_type: 图片 MIME 类型；服务端按字节识别，这里只作元数据。
+    """
+    return {"type": "image", "mimeType": mime_type or "image/png", "data": data}
+
+
+def prompt_blocks(
+    text: str, images: Sequence[Mapping[str, Any]] = ()
+) -> list[dict[str, Any]]:
+    """把文本与图片包成 ``session/prompt`` 的 ``prompt`` 数组。
+
+    * 文本为空时不发空文本块（纯图片消息由服务端补 ``[image]`` 占位）；
+    * 图片按 ``type`` / ``mimeType`` / ``data`` 的 image 块追加在文本之后；
+    * 最多只取前 :data:`MAX_PROMPT_IMAGES` 张，形状不对的条目跳过。
+    """
+    blocks: list[dict[str, Any]] = []
+    if text:
+        blocks.append(text_block(text))
+    image_count = 0
+    for image in images:
+        if image_count >= MAX_PROMPT_IMAGES:
+            break
+        if not isinstance(image, Mapping):
+            continue
+        data = image.get("data")
+        if not isinstance(data, str) or not data:
+            continue
+        mime_type = image.get("mimeType")
+        blocks.append(
+            image_block(data, mime_type if isinstance(mime_type, str) else "image/png")
+        )
+        image_count += 1
+    return blocks
 
 
 def extract_text(content: Any) -> str:

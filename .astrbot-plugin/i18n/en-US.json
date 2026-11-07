@@ -49,6 +49,14 @@
       "description": "Parse CQ codes in replies",
       "hint": "When enabled, [CQ:at,qq=...] / [CQ:face,id=...] / [CQ:poke,...] / [CQ:dice] / [CQ:rps] / [CQ:shake] in replies become components; every other CQ code is removed and never shown. Only the OneBot (aiocqhttp) platform builds components; other platforms just remove them. The runner panel takes precedence."
     },
+    "context_count": {
+      "description": "Context awareness: earlier messages per turn",
+      "hint": "Carry n earlier group messages into each turn; 0 disables it. Messages already waiting in the merge queue are skipped when counting. The runner panel value takes precedence."
+    },
+    "context_max_chars": {
+      "description": "Context awareness: max characters per earlier message",
+      "hint": "Earlier messages longer than k characters are skipped and do not count toward n (at most 2n messages are scanned). Messages actually sent in this turn are not affected. The runner panel value takes precedence."
+    },
     "auto_approve_enable": {
       "description": "Enable tool approval passthrough (Auto-Approve)",
       "hint": "Master switch for tool approvals. When disabled, session/request_permission is always deferred until someone sends /aapprove. When enabled, approvals may pass through the configured whitelist, prompt grants, or external hook grants. The runner panel value takes precedence."
